@@ -5,7 +5,8 @@ from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from groups.easy_sources import run_all
+from parsers.epravda_parser import parse_epravda
+from parsers.minfin_parser import parse_minfin
 
 # --------- базові налаштування ---------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -27,7 +28,6 @@ def _safe_str(v):
     return "" if v is None else str(v).strip()
 
 def _sanitize_item(d: dict) -> dict:
-    """Гарантовано повертає словник з потрібними ключами або {} якщо нема URL."""
     if not isinstance(d, dict):
         return {}
     url = _safe_str(d.get("url"))
@@ -43,9 +43,7 @@ def _sanitize_item(d: dict) -> dict:
     }
 
 def _format_sources(results: list[dict]) -> str:
-    """Групуємо за source -> section, ріжемо за лімітами та формуємо великий текст."""
     groups: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
-
     for raw in results:
         item = _sanitize_item(raw)
         if not item:
@@ -53,11 +51,10 @@ def _format_sources(results: list[dict]) -> str:
         groups[item["source"] or "epravda"][item["section"] or ""].append(item)
 
     blocks: list[str] = []
-    for src in ("epravda", "minfin"):  # стабільний порядок
+    for src in ("epravda", "minfin"):
         if src not in groups:
             continue
 
-        # плоский зріз PER_SOURCE_LIMIT
         flat: list[dict] = []
         for sec_items in groups[src].values():
             flat.extend(sec_items)
@@ -89,14 +86,12 @@ def _format_sources(results: list[dict]) -> str:
                 u = n.get("url") or ""
                 lines.append(f"{i}. {t} ({d})")
                 lines.append(f"   {u}")
-            lines.append("")  # порожній між секціями
-
+            lines.append("")
         blocks.append("\n".join(lines).rstrip())
 
     return "\n\n".join([b for b in blocks if b]).strip()
 
 def _hard_wrap(line: str, limit: int):
-    """Жорстко ріже один наддовгий рядок на шматки ≤ limit."""
     if len(line) <= limit:
         return [line]
     out = []
@@ -107,12 +102,6 @@ def _hard_wrap(line: str, limit: int):
     return out
 
 def _chunk_iter(text: str, limit: int):
-    """
-    Надійний чанкiнг:
-    1) по подвійних перенесеннях (абзаци),
-    2) якщо абзац довгий — по рядках,
-    3) якщо рядок довгий — жорстке обрізання.
-    """
     if not text:
         return
     for para in text.split("\n\n"):
@@ -121,11 +110,8 @@ def _chunk_iter(text: str, limit: int):
         if len(para) <= limit:
             yield para
             continue
-
-        # розкладемо абзац на рядки
         current = ""
         for raw_line in para.split("\n"):
-            # якщо один рядок довший за limit — поріжемо його
             for piece in _hard_wrap(raw_line, limit):
                 add = (piece + "\n")
                 if len(current) + len(add) > limit:
@@ -142,6 +128,32 @@ async def _send_long(message: types.Message, text: str):
         await message.answer(chunk, disable_web_page_preview=True)
         await asyncio.sleep(0)
 
+# --------- збір новин з таймаутами ---------
+async def _get_with_timeout(func, name: str, timeout_s: float) -> list[dict]:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(func), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        log.warning(f"{name}: timeout {timeout_s}s")
+        return []
+    except Exception as e:
+        log.warning(f"{name}: failed: {e}")
+        return []
+
+async def collect_news() -> list[dict]:
+    epravda = await _get_with_timeout(parse_epravda, "epravda", 10)
+    minfin  = await _get_with_timeout(parse_minfin,  "minfin",  10)
+
+    seen, out = set(), []
+    for it in (epravda or []) + (minfin or []):
+        if not isinstance(it, dict):
+            continue
+        url = (it.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(it)
+    return out
+
 # --------- хендлери ---------
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
@@ -154,9 +166,9 @@ async def start_cmd(message: types.Message):
 async def news_easy_cmd(message: types.Message):
     await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10 секунд.")
     try:
-        results = run_all()
+        results = await collect_news()
         if not results:
-            await message.answer("⚠️ Новини не знайдено.")
+            await message.answer("⚠️ Новини не знайдено або джерела не відповіли вчасно.")
             return
         text = _format_sources(results)
         await _send_long(message, text)
