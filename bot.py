@@ -1,289 +1,243 @@
 import os
 import asyncio
 import logging
-import json
-from typing import Any, Dict, List, Tuple
+import inspect
+from datetime import datetime
+from collections import defaultdict
+from typing import Any, Dict, List
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, Update
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# === Конфіг ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) if os.getenv("ADMIN_ID") else None
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+# ====== Конфіг ======
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()  # має вигляд: https://universal-bot-live.onrender.com
 
-# Безпечні межі Telegram
-TG_MAX = 4096
-SAFETY_MARGIN = 600
-CHUNK_LIMIT = TG_MAX - SAFETY_MARGIN  # ~3500 симв.
-PER_MESSAGE_DELAY = 0.05  # невелика пауза між повідомленнями, щоб не ловити флуд
+assert BOT_TOKEN, "BOT_TOKEN is required"
+assert WEBHOOK_URL, "WEBHOOK_URL is required"
 
-# Ніяких лімітів на кількість новин — шлемо всі, шматуємо за розміром
-SHOW_ALL = True
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+MAX_CHARS_PER_MSG = 3800           # безпечна межа <4096
+PAUSE_BETWEEN_MSGS_SEC = 0.06      # антифлуд
+SOURCE_ORDER = ["epravda", "minfin"]
 
-# Логи
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("news_bot")
+# ====== Логи ======
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("news-bot")
 
-# Aiogram v3
-router = Router()
-dp = Dispatcher()
-dp.include_router(router)
-bot = Bot(BOT_TOKEN, parse_mode=None)
-
-# Імпорт наших парсерів
+# ====== Імпорт парсера ======
+# Очікується, що groups/easy_sources.py має функцію run_all(), яка повертає:
+# 1) або dict: {source: List[items]} або {source: {"items": List[items], ...}}
+# 2) або загальний List[items], де кожен item має поля: source, title, url, date (YYYY-MM-DD або %Y-%m-%d), section
 try:
-    from groups.easy_sources import run_all as run_easy_sources  # обовʼязково існує за твоєю структурою
+    from groups.easy_sources import run_all as parse_all_sources
 except Exception as e:
-    log.exception("Помилка імпорту run_all(): %s", e)
-    run_easy_sources = None
+    log.exception("Не вдалося імпортувати groups.easy_sources.run_all()")
+    raise
 
-
-# ===================== Допоміжні =====================
-
-async def send_text_with_retry(chat_id: int, text: str) -> None:
-    """Надійна відправка з обробкою 429/BadRequest та короткою затримкою між повідомленнями."""
-    while True:
+# ====== Утиліти форматування/надсилання ======
+def _norm_date(s: Any) -> str:
+    if not s:
+        return ""
+    if isinstance(s, datetime):
+        return s.strftime("%Y-%m-%d")
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d", "%d/%m/%Y"):
         try:
-            await bot.send_message(chat_id, text)
-            await asyncio.sleep(PER_MESSAGE_DELAY)
-            return
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.2)
-        except TelegramBadRequest as e:
-            # Якщо текст все одно завеликий — подрібнити ще жорсткіше на 2000
-            if "message is too long" in str(e).lower():
-                for chunk in chunk_long_text(text, limit=2000):
-                    await send_text_with_retry(chat_id, chunk)
-                return
-            raise
-        except Exception as e:
-            log.exception("send_text_with_retry error: %s", e)
-            # невеликий бекап-ретрай
-            await asyncio.sleep(0.5)
+            return datetime.strptime(str(s).strip(), fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # якщо не розпізнали — повертаємо як є
+    return str(s)
 
-
-def chunk_long_text(text: str, limit: int = CHUNK_LIMIT) -> List[str]:
-    """Розбити довгий текст на шматки без розриву рядків/логіки."""
-    if len(text) <= limit:
-        return [text]
-    parts: List[str] = []
-    buf: List[str] = []
-    size = 0
-    for line in text.splitlines(keepends=True):
-        ln = len(line)
-        if size + ln > limit and buf:
-            parts.append("".join(buf).rstrip())
-            buf = [line]
-            size = ln
-        else:
-            buf.append(line)
-            size += ln
-    if buf:
-        parts.append("".join(buf).rstrip())
-    return parts
-
-
-def render_section_header(src: str, section: str, count: int) -> str:
-    sec = f" | секція: {section}" if section else ""
-    return f"Джерело: {src}{sec} — {count} новин:\n"
-
-
-def render_item_line(idx: int, title: str, date_str: str, url: str) -> str:
-    date_part = f" ({date_str})" if date_str else " (—)"
-    return f"{idx}. {title}{date_part}\n   {url}\n"
-
-
-def normalize_results(results: Any) -> List[Tuple[str, str, List[Dict[str, str]]]]:
-    """
-    Приводимо будь-яку структуру від run_all() до уніфікованої:
-    List[(source, section, items)], де item = {title, url, date?}
-    Це «мʼякий» нормалізатор: намагається підхопити різні варіанти.
-    """
-    out: List[Tuple[str, str, List[Dict[str, str]]]] = []
-
-    # Випадок: вже список секцій
-    if isinstance(results, list):
-        for sec in results:
-            src = sec.get("source") or sec.get("src") or sec.get("origin") or ""
-            section = sec.get("section") or sec.get("name") or ""
-            items = sec.get("items") or sec.get("list") or []
-            norm_items = []
-            for it in items:
-                title = (it.get("title") or it.get("name") or it.get("t") or "").strip()
-                url = (it.get("url") or it.get("link") or "").strip()
-                date_str = (it.get("date") or it.get("date_str") or it.get("d") or "").strip()
-                if title and url:
-                    norm_items.append({"title": title, "url": url, "date": date_str})
-            if norm_items:
-                out.append((src, section, norm_items))
-        return out
-
-    # Випадок: dict з ключами-джерелами
-    if isinstance(results, dict):
-        for src, sec_val in results.items():
-            if isinstance(sec_val, dict):
-                for section, items in sec_val.items():
-                    norm_items = []
-                    for it in items if isinstance(items, list) else []:
-                        title = (it.get("title") or it.get("name") or it.get("t") or "").strip()
-                        url = (it.get("url") or it.get("link") or "").strip()
-                        date_str = (it.get("date") or it.get("date_str") or it.get("d") or "").strip()
-                        if title and url:
-                            norm_items.append({"title": title, "url": url, "date": date_str})
-                    if norm_items:
-                        out.append((str(src), str(section), norm_items))
-            elif isinstance(sec_val, list):
-                norm_items = []
-                for it in sec_val:
-                    title = (it.get("title") or it.get("name") or it.get("t") or "").strip()
-                    url = (it.get("url") or it.get("link") or "").strip()
-                    date_str = (it.get("date") or it.get("date_str") or it.get("d") or "").strip()
-                    if title and url:
-                        norm_items.append({"title": title, "url": url, "date": date_str})
-                if norm_items:
-                    out.append((str(src), "", norm_items))
-        return out
-
-    # Якщо зовсім інше — спробуємо парою рядків
-    text = str(results).strip()
-    if text:
-        out.append(("результат", "", [{"title": "Вивід парсера", "url": "", "date": ""},]))
+def _dedup_by_url(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for it in items:
+        url = (it.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(it)
     return out
 
-
-def build_all_messages(results: Any) -> List[str]:
+def _group_by_source(items_or_map: Any) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Побудувати повні тексти для розсилки, без лімітів по кількості новин.
-    Потім вони додатково ріжуться по CHUNK_LIMIT.
+    Повертає {source: [items]} для будь-якої форми, що прийде з парсера.
     """
-    norm = normalize_results(results)
-    if not norm:
-        return ["⚠️ Нічого не знайдено."]
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    messages: List[str] = []
-    for src, section, items in norm:
-        header = render_section_header(src or "джерело", section, len(items))
-        buf_lines: List[str] = [header]
-        counter = 1
-        for it in items:
-            line = render_item_line(counter, it["title"], it.get("date", ""), it["url"])
-            buf_lines.append(line)
-            counter += 1
-        full_text = "".join(buf_lines).rstrip()
-        messages.extend(chunk_long_text(full_text, CHUNK_LIMIT))
+    # Випадок: dict зі списками або dict із ключем "items"
+    if isinstance(items_or_map, dict):
+        for src, payload in items_or_map.items():
+            if isinstance(payload, dict) and "items" in payload:
+                arr = payload.get("items") or []
+            else:
+                arr = payload or []
+            if not isinstance(arr, list):
+                continue
+            for it in arr:
+                if isinstance(it, dict):
+                    it.setdefault("source", src)
+                    grouped[src].append(it)
+        return grouped
+
+    # Випадок: загальний список
+    if isinstance(items_or_map, list):
+        for it in items_or_map:
+            if not isinstance(it, dict):
+                continue
+            src = (it.get("source") or "").strip().lower() or "unknown"
+            grouped[src].append(it)
+        return grouped
+
+    # Інше — порожньо
+    return {}
+
+def _sort_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # Сортуємо за датою (нові зверху), потім за назвою
+    def key(it):
+        d = _norm_date(it.get("date"))
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            dt = datetime.min
+        return (-int(dt.timestamp()), (it.get("title") or "").lower())
+    return sorted(items, key=key)
+
+def _format_lines(items: List[Dict[str, Any]]) -> List[str]:
+    lines = []
+    for idx, it in enumerate(items, 1):
+        title = (it.get("title") or "").strip()
+        url = (it.get("url") or "").strip()
+        d = _norm_date(it.get("date"))
+        suffix = f" ({d})" if d else ""
+        # Дві строки на запис: заголовок + посилання з відступом
+        lines.append(f"{idx}. {title}{suffix}")
+        lines.append(f"   {url}")
+    return lines
+
+def _chunk_and_build_messages(header: str, lines: List[str]) -> List[str]:
+    """
+    Розбиває контент на чанки < MAX_CHARS_PER_MSG.
+    """
+    messages = []
+    cur = header.strip()
+    for line in lines:
+        piece = ("\n" + line)
+        if len(cur) + len(piece) > MAX_CHARS_PER_MSG:
+            messages.append(cur)
+            cur = line
+        else:
+            cur += piece
+    if cur:
+        messages.append(cur)
     return messages
 
+async def _safe_send_many(bot: Bot, chat_id: int, messages: List[str]):
+    for m in messages:
+        # Telegram hard cap 4096 символів
+        if len(m) > 4096:
+            # додаткова перестраховка (не має спрацювати з нашою межою)
+            start = 0
+            while start < len(m):
+                await bot.send_message(chat_id, m[start:start+3800])
+                start += 3800
+                await asyncio.sleep(PAUSE_BETWEEN_MSGS_SEC)
+        else:
+            await bot.send_message(chat_id, m)
+        await asyncio.sleep(PAUSE_BETWEEN_MSGS_SEC)
 
-async def process_news_easy(chat_id: int, progress_msg: Message | None) -> None:
-    """Фонова обробка: парсинг та відправка всіх новин шматками."""
-    try:
-        if run_easy_sources is None:
-            raise RuntimeError("run_all() недоступний")
-
-        # Виклик нашого парсера. Ніяких зрізів — беремо все.
-        results = await maybe_await(run_easy_sources)
-
-        all_msgs = build_all_messages(results)
-        # Якщо дуже багато шматків — попередження про кількість
-        if len(all_msgs) > 1:
-            first_line = f"✅ Знайдено багато новин. Відправляю {len(all_msgs)} повідомлення(нь)."
-            await send_text_with_retry(chat_id, first_line)
-
-        for m in all_msgs:
-            if m.strip():
-                await send_text_with_retry(chat_id, m)
-
-        if progress_msg:
-            try:
-                await progress_msg.edit_text("✅ Готово.")
-            except Exception:
-                pass
-
-    except Exception as e:
-        log.exception("process_news_easy error: %s", e)
-        if progress_msg:
-            try:
-                await progress_msg.edit_text("❌ Помилка під час збору новин.")
-            except Exception:
-                pass
-        if ADMIN_ID:
-            try:
-                await send_text_with_retry(ADMIN_ID, f"❌ Помилка /news_easy: {e}")
-            except Exception:
-                pass
-
-
-async def maybe_await(x):
-    if asyncio.iscoroutinefunction(x):
-        return await x()
-    if asyncio.iscoroutine(x):
+async def _maybe_await(x):
+    if inspect.isawaitable(x):
         return await x
-    return x  # синхронний результат
+    return x
 
+# ====== Бот/Диспетчер ======
+dp = Dispatcher()
+bot = Bot(BOT_TOKEN, parse_mode=None)  # без HTML/Markdown, щоб не ламати тексти
 
-# ===================== Хендлери =====================
-
-@router.message(F.text == "/start")
+@dp.message(CommandStart())
 async def cmd_start(message: Message):
     text = (
         "👋 Привіт! Доступні команди:\n"
-        "• /news_easy — Epravda + Minfin (всі новини; без превʼю)"
+        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)"
     )
     await message.answer(text)
 
-
-@router.message(F.text == "/news_easy")
+@dp.message(Command("news_easy"))
 async def cmd_news_easy(message: Message):
-    # Миттєва відповідь, далі — фоном
-    progress = await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд.")
-    asyncio.create_task(process_news_easy(message.chat.id, progress))
-
-
-# ===================== AIOHTTP: webhook & health =====================
-
-async def handle_webhook(request: web.Request):
+    chat_id = message.chat.id
+    waiting = "⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд."
     try:
-        data = await request.json()
+        await message.answer(waiting)
     except Exception:
-        return web.Response(text="Bad Request", status=400)
-    try:
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        log.exception("feed_update error: %s", e)
-    return web.Response(text="OK")
+        pass
 
-async def handle_health(request: web.Request):
+    try:
+        raw = await _maybe_await(parse_all_sources())
+        grouped = _group_by_source(raw)
+
+        if not grouped:
+            await bot.send_message(chat_id, "⚠️ Новини не знайдено.")
+            await bot.send_message(chat_id, "✅ Готово.")
+            return
+
+        # Порядок джерел фіксуємо, решту додаємо вкінці
+        ordered_sources = [s for s in SOURCE_ORDER if s in grouped] + [s for s in grouped.keys() if s not in SOURCE_ORDER]
+
+        for source in ordered_sources:
+            items = grouped.get(source, [])
+            # Уніфікація: дата/секція/дедуп/сортування
+            for it in items:
+                it["date"] = _norm_date(it.get("date"))
+                it["section"] = (it.get("section") or "").strip().lower()
+
+            items = _dedup_by_url(items)
+            items = _sort_items(items)
+
+            total = len(items)
+            if total == 0:
+                continue
+
+            # Формуємо лінії і чанкi
+            header = f"✅ {source} — показую {total} з {total}"
+            lines = _format_lines(items)
+            messages = _chunk_and_build_messages(header, lines)
+            await _safe_send_many(bot, chat_id, messages)
+
+        await bot.send_message(chat_id, "✅ Готово.")
+
+    except Exception as e:
+        log.exception("Помилка у /news_easy: %s", e)
+        try:
+            await bot.send_message(chat_id, "⚠️ Сталася помилка під час формування списку новин.")
+        except Exception:
+            pass
+
+# ====== AIOHTTP APP (health + webhook) ======
+async def health(request: web.Request) -> web.Response:
     return web.json_response({"status": "alive"})
 
-async def handle_parse(request: web.Request):
-    """Сервісний ендпойнт для швидкої перевірки парсера (JSON-результат)."""
-    try:
-        if run_easy_sources is None:
-            raise RuntimeError("run_all() недоступний")
-        results = await maybe_await(run_easy_sources)
-        return web.json_response({"ok": True, "results": results}, dumps=lambda o: json.dumps(o, ensure_ascii=False))
-    except Exception as e:
-        log.exception("/parse error: %s", e)
-        return web.json_response({"ok": False, "error": str(e)})
-
-def make_app() -> web.Application:
+def build_app() -> web.Application:
     app = web.Application()
-    # Вебхук строго на /webhook/<BOT_TOKEN>
-    app.router.add_post(f"/webhook/{BOT_TOKEN}", handle_webhook)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/parse", handle_parse)
+    app.router.add_get("/health", health)
+
+    # Webhook handler
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
     return app
 
+# ====== Запуск ======
+app = build_app()
 
 if __name__ == "__main__":
-    if not BOT_TOKEN or not WEBHOOK_URL:
-        raise SystemExit("BOT_TOKEN/WEBHOOK_URL не задані в env.")
-
-    app = make_app()
-    port = int(os.getenv("PORT", "10000"))
-    log.info("======== Running on http://0.0.0.0:%d ========", port)
-    web.run_app(app, port=port)
+    # Локальний запуск (Render викликає так само)
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
