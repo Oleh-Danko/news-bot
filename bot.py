@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -18,15 +19,17 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 # --------- хелпери форматування/відправки ---------
-CHUNK_LIMIT = 3500           # запас до 4096
-PER_SECTION_LIMIT = 12       # не більше N пунктів на секцію
-PER_SOURCE_LIMIT  = 60       # “стеля” на джерело (щоб точно не впертися в ліміт)
+CHUNK_LIMIT = 3000           # запас проти 4096
+PER_SECTION_LIMIT = 12       # максимум пунктів на секцію
+PER_SOURCE_LIMIT  = 60       # максимум карток з одного джерела
 
 def _safe_str(v):
     return "" if v is None else str(v).strip()
 
 def _sanitize_item(d: dict) -> dict:
     """Гарантовано повертає словник з потрібними ключами або {} якщо нема URL."""
+    if not isinstance(d, dict):
+        return {}
     url = _safe_str(d.get("url"))
     if not url:
         return {}
@@ -39,83 +42,105 @@ def _sanitize_item(d: dict) -> dict:
         "section_url": _safe_str(d.get("section_url") or ""),
     }
 
-def _format_block(header: str, lines: list[str]) -> str:
-    body = "\n".join(lines)
-    return f"{header}\n{body}".strip()
-
-async def _send_chunks(message: types.Message, text: str):
-    """Розбиває довгі відповіді на безпечні шматки й шле по черзі."""
-    if not text:
-        return
-    # розбивка по абзацах з запасом
-    parts = text.split("\n\n")
-    buf = ""
-    for p in parts:
-        add = (p + "\n\n")
-        if len(buf) + len(add) > CHUNK_LIMIT:
-            await message.answer(buf.rstrip(), disable_web_page_preview=True)
-            buf = add
-        else:
-            buf += add
-    if buf.strip():
-        await message.answer(buf.rstrip(), disable_web_page_preview=True)
-
-def _build_text(results: list[dict]) -> str:
-    """
-    Групуємо за source -> section, ріжемо за лімітами,
-    формуємо один великий текст (далі його розіб’є _send_chunks).
-    """
+def _format_sources(results: list[dict]) -> str:
+    """Групуємо за source -> section, ріжемо за лімітами та формуємо великий текст."""
     groups: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
 
     for raw in results:
-        item = _sanitize_item(raw if isinstance(raw, dict) else {})
+        item = _sanitize_item(raw)
         if not item:
             continue
-        src = item["source"] or "epravda"
-        sec = item["section"] or ""
-        groups[src][sec].append(item)
+        groups[item["source"] or "epravda"][item["section"] or ""].append(item)
 
-    # формуємо тексти по джерелах
-    out_blocks: list[str] = []
+    blocks: list[str] = []
     for src in ("epravda", "minfin"):  # стабільний порядок
         if src not in groups:
             continue
-        # плоский список для ліміту PER_SOURCE_LIMIT
+
+        # плоский зріз PER_SOURCE_LIMIT
         flat: list[dict] = []
-        for sec, items in groups[src].items():
-            flat.extend(items)
+        for sec_items in groups[src].values():
+            flat.extend(sec_items)
         if len(flat) > PER_SOURCE_LIMIT:
-            # підріжемо найстарші хвости
             flat = flat[:PER_SOURCE_LIMIT]
-            # перезберемо назад у секції по зрізаному списку
             sec_map: dict[str, list[dict]] = defaultdict(list)
             for it in flat:
-                sec_map[it["section"]].append(it)
+                sec_map[it.get("section","")].append(it)
             groups[src] = sec_map
 
         total_found = sum(len(v) for v in groups[src].values())
-        total_unique = total_found  # дублікати вже прибрано в run_all()
+        total_unique = total_found
 
-        header = f"✅ {src} — результат:\nУсього знайдено: {total_found} (з урахуванням дублів)\nУнікальних новин: {total_unique}"
-        lines: list[str] = [header, ""]
+        lines: list[str] = []
+        lines.append(f"✅ {src} — результат:")
+        lines.append(f"Усього знайдено: {total_found} (з урахуванням дублів)")
+        lines.append(f"Унікальних новин: {total_unique}")
+        lines.append("")
 
-        # секції у стабільному порядку
         for sec_name in sorted(groups[src].keys()):
             sec_items = groups[src][sec_name][:PER_SECTION_LIMIT]
             if not sec_items:
                 continue
-            sec_link = sec_items[0].get("section_url") or sec_name or "-"
+            sec_link = sec_items[0].get("section_url") or (sec_name or "-")
             lines.append(f"Джерело: {sec_link} — {len(sec_items)} новин:")
             for i, n in enumerate(sec_items, 1):
-                t = n["title"] or "—"
-                d = n["date"] or "—"
-                u = n["url"]
-                lines.append(f"{i}. {t} ({d})\n   {u}")
-            lines.append("")  # порожній рядок між секціями
+                t = n.get("title") or "—"
+                d = n.get("date") or "—"
+                u = n.get("url") or ""
+                lines.append(f"{i}. {t} ({d})")
+                lines.append(f"   {u}")
+            lines.append("")  # порожній між секціями
 
-        out_blocks.append("\n".join(lines).rstrip())
+        blocks.append("\n".join(lines).rstrip())
 
-    return "\n\n".join(b for b in out_blocks if b).strip()
+    return "\n\n".join([b for b in blocks if b]).strip()
+
+def _hard_wrap(line: str, limit: int):
+    """Жорстко ріже один наддовгий рядок на шматки ≤ limit."""
+    if len(line) <= limit:
+        return [line]
+    out = []
+    s = 0
+    while s < len(line):
+        out.append(line[s:s+limit])
+        s += limit
+    return out
+
+def _chunk_iter(text: str, limit: int):
+    """
+    Надійний чанкiнг:
+    1) по подвійних перенесеннях (абзаци),
+    2) якщо абзац довгий — по рядках,
+    3) якщо рядок довгий — жорстке обрізання.
+    """
+    if not text:
+        return
+    for para in text.split("\n\n"):
+        if not para:
+            continue
+        if len(para) <= limit:
+            yield para
+            continue
+
+        # розкладемо абзац на рядки
+        current = ""
+        for raw_line in para.split("\n"):
+            # якщо один рядок довший за limit — поріжемо його
+            for piece in _hard_wrap(raw_line, limit):
+                add = (piece + "\n")
+                if len(current) + len(add) > limit:
+                    if current.strip():
+                        yield current.rstrip()
+                    current = add
+                else:
+                    current += add
+        if current.strip():
+            yield current.rstrip()
+
+async def _send_long(message: types.Message, text: str):
+    for chunk in _chunk_iter(text, CHUNK_LIMIT):
+        await message.answer(chunk, disable_web_page_preview=True)
+        await asyncio.sleep(0)
 
 # --------- хендлери ---------
 @dp.message(Command("start"))
@@ -133,8 +158,8 @@ async def news_easy_cmd(message: types.Message):
         if not results:
             await message.answer("⚠️ Новини не знайдено.")
             return
-        text = _build_text(results)
-        await _send_chunks(message, text)
+        text = _format_sources(results)
+        await _send_long(message, text)
     except Exception as e:
         await message.answer(f"❌ Помилка під час збору новин: {e}")
 
