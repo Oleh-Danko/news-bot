@@ -1,65 +1,47 @@
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from groups.easy_sources import run_all
 
-from parsers.epravda_parser import parse_epravda
-from parsers.minfin_parser import parse_minfin
+BOT_TOKEN = "8392167879:AAG9GgPCXrajvdZca5vJcYopk3HO5w2hBhE"
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 
-def run_all():
-    results = {}
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message):
+    await message.answer(
+        "👋 Привіт! Надішли /news — отримаєш актуальні новини з Економічної Правди (розділ «Фінанси»)."
+    )
 
-    print("🔹 Парсимо Epravda...")
+
+@dp.message(Command("news"))
+async def news_easy_cmd(message: types.Message):
+    await message.answer("⏳ Збираю новини з Epravda /finances …")
     try:
-        epravda_news = parse_epravda()
-        results["epravda"] = epravda_news
+        results = run_all()
+        if not results:
+            await message.answer("⚠️ Новини не знайдені.")
+            return
+
+        text = ""
+        for i, n in enumerate(results, 1):
+            text += f"{i}. {n['title']} ({n['date']})\n{n['url']}\n\n"
+
+        # Ділимо на частини, щоб не перевищувати 4096 символів
+        parts = [text[i:i + 4000] for i in range(0, len(text), 4000)]
+        for part in parts:
+            await message.answer(part, disable_web_page_preview=True)
+
     except Exception as e:
-        print(f"❌ Epravda не вдалося: {e}")
-        results["epravda"] = []
-
-    print("🔹 Парсимо Minfin...")
-    try:
-        minfin_news = parse_minfin()
-        results["minfin"] = minfin_news
-    except Exception as e:
-        print(f"❌ Minfin не вдалося: {e}")
-        results["minfin"] = []
-
-    return results
+        await message.answer(f"❌ Помилка під час збору новин: {e}")
 
 
-def format_news(results: dict) -> str:
-    text = ""
+async def main():
+    print("✅ Bot started successfully")
+    await dp.start_polling(bot)
 
-    # === EPRAVDA ===
-    epravda = results.get("epravda", [])
-    if epravda:
-        text += f"✅ epravda - результат:\n"
-        text += f"   Усього знайдено {len(epravda)} (з урахуванням дублів)\n"
-        text += f"   Унікальних новин: {len(epravda)}\n\n"
 
-        finances = [n for n in epravda if n.get("section") == "finances"]
-        columns = [n for n in epravda if n.get("section") == "columns"]
-
-        if finances:
-            text += f"Джерело: https://epravda.com.ua/finances — {len(finances)} новин:\n"
-            for i, n in enumerate(finances, 1):
-                text += f"{i}. {n['title']} ({n['date']})\n   {n['url']}\n"
-            text += "\n"
-
-        if columns:
-            text += f"Джерело: https://epravda.com.ua/columns — {len(columns)} новин:\n"
-            for i, n in enumerate(columns, 1):
-                text += f"{i}. {n['title']} ({n['date']})\n   {n['url']}\n"
-            text += "\n"
-
-    # === MINFIN ===
-    minfin = results.get("minfin", [])
-    if minfin:
-        text += f"✅ minfin - результат:\n"
-        text += f"   Унікальних новин: {len(minfin)}\n\n"
-        text += f"Джерела: https://minfin.com.ua/news ...\n"
-        for i, n in enumerate(minfin, 1):
-            text += f"{i}. {n['title']} ({n['date']})\n   {n['url']}\n"
-        text += "\n"
-
-    return text
+if __name__ == "__main__":
+    asyncio.run(main())
