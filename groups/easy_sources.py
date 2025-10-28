@@ -1,10 +1,13 @@
 # groups/easy_sources.py
 import asyncio
 import logging
-from typing import List, Dict
+import re
+from typing import List, Dict, Optional
 from aiohttp import ClientSession
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("easy_sources")
 
@@ -13,11 +16,13 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml",
 }
 
+TZ = ZoneInfo("Europe/Kyiv")
+
 EP_BASE = "https://epravda.com.ua"
 MF_BASE = "https://minfin.com.ua"
 
 EP_PAGES = [
-    "/finances",
+    "/finances",  # беремо лише фінанси; інші розділи можуть підтягуватись перехресними лінками
 ]
 MF_PAGES = [
     "/ua/news",
@@ -25,21 +30,71 @@ MF_PAGES = [
     "/ua/news/commerce/",
 ]
 
-MAX_PER_PAGE = 60  # жорстка «стеля», потім ще буде дедуп
+MAX_PER_PAGE = 60  # захисна «стеля» зі сторінки
 
-def _norm(space: str) -> str:
-    return " ".join(space.split()) if isinstance(space, str) else space
+UA_MONTHS = {
+    "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
+    "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
+}
 
-def _add(items: List[Dict], title: str, href: str, date: str, src: str, category: str):
+def _norm(s: str) -> str:
+    return " ".join(s.split()) if isinstance(s, str) else s
+
+def _add(items: List[Dict], title: str, href: str, date_text: str, src: str, category: str):
     if not href or not title:
         return
     items.append({
         "title": _norm(title),
         "link": href.strip(),
-        "published": _norm(date) if date else "",
+        "published": _norm(date_text) if date_text else "",
         "src": src,
         "category": category.strip("/") or "news",
     })
+
+def _extract_date_from_url(url: str) -> Optional[date]:
+    # minfin: /YYYY/MM/DD/
+    m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", url)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    return None
+
+def _extract_date_from_text(text: str) -> Optional[date]:
+    if not text:
+        return None
+    # 2025-10-28
+    m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", text)
+    if m:
+        y, mo, d = map(int, m.groups())
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    # «28 жовтня 2025»
+    m = re.search(r"(\d{1,2})\s+([А-Яа-яІіЇїЄєҐґ]+)\s+(20\d{2})", text)
+    if m:
+        d = int(m.group(1))
+        mon = UA_MONTHS.get(m.group(2).lower())
+        y = int(m.group(3))
+        if mon:
+            try:
+                return date(y, mon, d)
+            except ValueError:
+                return None
+    return None
+
+def _only_today_yesterday(items: List[Dict]) -> List[Dict]:
+    today = datetime.now(TZ).date()
+    yesterday = today - timedelta(days=1)
+    out = []
+    for it in items:
+        d = _extract_date_from_url(it["link"]) or _extract_date_from_text(it.get("published", ""))
+        if d and (d == today or d == yesterday):
+            out.append(it)
+    return out
 
 async def _fetch(session: ClientSession, url: str) -> str:
     async with session.get(url, headers=HEADERS, timeout=20) as r:
@@ -49,17 +104,17 @@ async def _fetch(session: ClientSession, url: str) -> str:
 def _parse_epravda(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict] = []
-    # Типові картки списків: a.item__title / article.list-item
+    # типові тайтл-лінки
     for a in soup.select("a.item__title, article a.article__title, article a.list-item__title"):
         href = a.get("href") or ""
         if href.startswith("/"):
             href = urljoin(EP_BASE, href)
         title = a.get_text(strip=True)
-        # дата поряд / в блоці (часто у списках відсутня — припускаємо пусто)
-        date_el = a.find_parent(["article", "div"])
+        # шукаємо time/date поряд, якщо є
         date_text = ""
-        if date_el:
-            dt = date_el.select_one("time, .article__date, .list-item__date")
+        parent = a.find_parent(["article", "div", "li"])
+        if parent:
+            dt = parent.select_one("time, .article__date, .list-item__date")
             if dt:
                 date_text = dt.get_text(" ", strip=True)
         # категорія з URL
@@ -76,29 +131,25 @@ def _parse_epravda(html: str, path: str) -> List[Dict]:
 def _parse_minfin(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict] = []
-    # Посилання у стрічці новин
+    # беремо тільки лінки з датою у URL
     for a in soup.select("a[href*='/2025/'], a[href*='/ua/2025/']"):
         href = a.get("href") or ""
         text = a.get_text(strip=True)
-        # фільтр від сміття: потрібні повні новини з id
-        if not text or "/news/" in href and href.count("/") < 5:
+        if not text:
             continue
         if href.startswith("/"):
             href = urljoin(MF_BASE, href)
-        # дата у блоці поруч
+        # дата з URL (на minfin це надійніше, ніж текст)
         date_text = ""
-        row = a.find_parent(["li", "article", "div"])
-        if row:
-            dt = row.select_one("time, .time, .date")
-            if dt:
-                date_text = dt.get_text(" ", strip=True)
+        d = _extract_date_from_url(href)
+        if d:
+            date_text = d.isoformat()
         # категорія з URL
         cat = "news"
         try:
             tail = href.split(MF_BASE)[-1]
             parts = [p for p in tail.split("/") if p]
-            if len(parts) >= 2 and parts[0] in ("ua",):
-                # ua/news/commerce/...
+            if len(parts) >= 2 and parts[0] == "ua":
                 cat = parts[2] if len(parts) > 2 else "news"
             elif len(parts) >= 1:
                 cat = parts[0]
@@ -110,9 +161,7 @@ def _parse_minfin(html: str, path: str) -> List[Dict]:
     return out
 
 async def _gather_all() -> List[Dict]:
-    items: List[Dict] = []
     async with ClientSession() as session:
-        # Epravda
         ep_all: List[Dict] = []
         for p in EP_PAGES:
             try:
@@ -120,7 +169,7 @@ async def _gather_all() -> List[Dict]:
                 ep_all.extend(_parse_epravda(html, p))
             except Exception as e:
                 log.warning(f"epravda fetch fail {p}: {e}")
-        # Minfin
+
         mf_all: List[Dict] = []
         for p in MF_PAGES:
             try:
@@ -129,41 +178,42 @@ async def _gather_all() -> List[Dict]:
             except Exception as e:
                 log.warning(f"minfin fetch fail {p}: {e}")
 
-    # Дедуп за URL, пріоритет — перша зустріч
+    # дедуп за URL
     seen = set()
+    items: List[Dict] = []
     for arr in (ep_all, mf_all):
         for it in arr:
-            u = it.get("link")
-            if u and u not in seen:
+            u = it["link"]
+            if u not in seen:
                 seen.add(u)
                 items.append(it)
 
-    # Логи як у твоєму форматі
+    # лог до фільтра
+    total_before = len(items)
+    log.info(f"🔹 Парсимо Epravda/Minfin... Всього (до фільтра): {total_before}")
+
+    # фільтр тільки «сьогодні/вчора» + відсікаємо без дати
+    items = _only_today_yesterday(items)
+    total_after = len(items)
+    log.info(f"🔹 Після фільтра дати (сьогодні/вчора): {total_after}")
+
+    # короткий зріз по джерелах
     def _summ(src: str):
         arr = [x for x in items if x["src"] == src]
-        log.info(f"✅ {src} - результат:\n   Унікальних новин: {len(arr)}")
-        # простий зріз по категоріях
-        bycat = {}
-        for x in arr:
-            bycat.setdefault(x["category"], 0)
-            bycat[x["category"]] += 1
-        for c, n in sorted(bycat.items(), key=lambda kv: -kv[1])[:5]:
-            log.info(f"   {src}:{c} — {n}")
+        log.info(f"✅ {src} — {len(arr)}")
 
-    log.info("🔹 Парсимо Epravda/Minfin...")
     _summ("epravda")
     _summ("minfin")
     return items
 
 def run_all() -> List[Dict]:
     """
-    СИНХРОННА обгортка, яка ПОВЕРТАЄ список елементів:
-    {
-      'title': str,
-      'link': str,
-      'published': str,
-      'src': 'epravda'|'minfin',
-      'category': str
-    }
+    Повертає список елементів лише за «сьогодні/вчора».
+    Елемент:
+      title: str
+      link: str
+      published: YYYY-MM-DD або вихідний текст (якщо був)
+      src: 'epravda' | 'minfin'
+      category: str
     """
     return asyncio.run(_gather_all())
