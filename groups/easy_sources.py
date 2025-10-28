@@ -1,47 +1,31 @@
-import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from groups.easy_sources import run_all
+# groups/easy_sources.py
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BOT_TOKEN = "8392167879:AAG9GgPCXrajvdZca5vJcYopk3HO5w2hBhE"
+from parsers.epravda_parser import parse_epravda
+from parsers.minfin_parser import parse_minfin
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+def run_all():
+    all_news = []
 
-
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "👋 Привіт! Надішли /news — отримаєш актуальні новини з Економічної Правди (розділ «Фінанси»)."
-    )
-
-
-@dp.message(Command("news"))
-async def news_easy_cmd(message: types.Message):
-    await message.answer("⏳ Збираю новини з Epravda /finances …")
     try:
-        results = run_all()
-        if not results:
-            await message.answer("⚠️ Новини не знайдені.")
-            return
-
-        text = ""
-        for i, n in enumerate(results, 1):
-            text += f"{i}. {n['title']} ({n['date']})\n{n['url']}\n\n"
-
-        # Ділимо на частини, щоб не перевищувати 4096 символів
-        parts = [text[i:i + 4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            await message.answer(part, disable_web_page_preview=True)
-
+        epravda_news = parse_epravda()
+        all_news.extend(epravda_news)
     except Exception as e:
-        await message.answer(f"❌ Помилка під час збору новин: {e}")
+        print(f"Epravda error: {e}")
 
+    try:
+        minfin_news = parse_minfin()
+        all_news.extend(minfin_news)
+    except Exception as e:
+        print(f"Minfin error: {e}")
 
-async def main():
-    print("✅ Bot started successfully")
-    await dp.start_polling(bot)
+    # дедуп за URL
+    seen, unique = set(), []
+    for n in all_news:
+        url = n.get("url")
+        if url and url not in seen:
+            unique.append(n)
+            seen.add(url)
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return unique
