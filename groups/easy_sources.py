@@ -1,85 +1,169 @@
 # groups/easy_sources.py
-from urllib.parse import urlparse
-from parsers.epravda_parser import parse_epravda
-from parsers.minfin_parser import parse_minfin
+import asyncio
+import logging
+from typing import List, Dict
+from aiohttp import ClientSession
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-def _detect_source_section(url: str):
-    try:
-        p = urlparse(url)
-        host = p.netloc
-        path = p.path.strip("/")
-        section = path.split("/")[0] if path else ""
-        if "epravda.com.ua" in host:
-            source = "epravda"
-            section_url = f"https://epravda.com.ua/{section}" if section else "https://epravda.com.ua"
-        elif "minfin.com.ua" in host:
-            source = "minfin"
-            section_url = f"https://minfin.com.ua/ua/{section}" if section else "https://minfin.com.ua/ua"
-        else:
-            source = host or "unknown"
-            section_url = f"https://{host}/{section}" if host else url
-        return source, (section or "root"), section_url
-    except Exception:
-        return "unknown", "root", url
+log = logging.getLogger("easy_sources")
 
-def _sanitize_item(x):
-    # Приводимо будь-що до словника потрібного формату або повертаємо None
-    if isinstance(x, dict):
-        title = str(x.get("title") or x.get("name") or "—").strip()
-        date  = str(x.get("date") or x.get("time") or "—").strip()
-        url   = str(x.get("url")  or x.get("link") or "").strip()
-    elif isinstance(x, (list, tuple)) and len(x) >= 2:
-        title, url = str(x[0]).strip(), str(x[1]).strip()
-        date = "—"
-    elif isinstance(x, str):
-        title, url, date = x.strip()[:120], "", "—"
-    else:
-        return None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+}
 
-    if not url:
-        return None
+EP_BASE = "https://epravda.com.ua"
+MF_BASE = "https://minfin.com.ua"
 
-    source, section, section_url = _detect_source_section(url)
-    return {
-        "title": title or "—",
-        "date":  date or "—",
-        "url":   url,
-        "source": source,
-        "section": section,
-        "section_url": section_url,
+EP_PAGES = [
+    "/finances",
+]
+MF_PAGES = [
+    "/ua/news",
+    "/ua/news/money-management/",
+    "/ua/news/commerce/",
+]
+
+MAX_PER_PAGE = 60  # жорстка «стеля», потім ще буде дедуп
+
+def _norm(space: str) -> str:
+    return " ".join(space.split()) if isinstance(space, str) else space
+
+def _add(items: List[Dict], title: str, href: str, date: str, src: str, category: str):
+    if not href or not title:
+        return
+    items.append({
+        "title": _norm(title),
+        "link": href.strip(),
+        "published": _norm(date) if date else "",
+        "src": src,
+        "category": category.strip("/") or "news",
+    })
+
+async def _fetch(session: ClientSession, url: str) -> str:
+    async with session.get(url, headers=HEADERS, timeout=20) as r:
+        r.raise_for_status()
+        return await r.text()
+
+def _parse_epravda(html: str, path: str) -> List[Dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Dict] = []
+    # Типові картки списків: a.item__title / article.list-item
+    for a in soup.select("a.item__title, article a.article__title, article a.list-item__title"):
+        href = a.get("href") or ""
+        if href.startswith("/"):
+            href = urljoin(EP_BASE, href)
+        title = a.get_text(strip=True)
+        # дата поряд / в блоці (часто у списках відсутня — припускаємо пусто)
+        date_el = a.find_parent(["article", "div"])
+        date_text = ""
+        if date_el:
+            dt = date_el.select_one("time, .article__date, .list-item__date")
+            if dt:
+                date_text = dt.get_text(" ", strip=True)
+        # категорія з URL
+        cat = "news"
+        try:
+            cat = href.split(EP_BASE)[-1].split("/")[1]
+        except Exception:
+            pass
+        _add(out, title, href, date_text, "epravda", cat)
+        if len(out) >= MAX_PER_PAGE:
+            break
+    return out
+
+def _parse_minfin(html: str, path: str) -> List[Dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Dict] = []
+    # Посилання у стрічці новин
+    for a in soup.select("a[href*='/2025/'], a[href*='/ua/2025/']"):
+        href = a.get("href") or ""
+        text = a.get_text(strip=True)
+        # фільтр від сміття: потрібні повні новини з id
+        if not text or "/news/" in href and href.count("/") < 5:
+            continue
+        if href.startswith("/"):
+            href = urljoin(MF_BASE, href)
+        # дата у блоці поруч
+        date_text = ""
+        row = a.find_parent(["li", "article", "div"])
+        if row:
+            dt = row.select_one("time, .time, .date")
+            if dt:
+                date_text = dt.get_text(" ", strip=True)
+        # категорія з URL
+        cat = "news"
+        try:
+            tail = href.split(MF_BASE)[-1]
+            parts = [p for p in tail.split("/") if p]
+            if len(parts) >= 2 and parts[0] in ("ua",):
+                # ua/news/commerce/...
+                cat = parts[2] if len(parts) > 2 else "news"
+            elif len(parts) >= 1:
+                cat = parts[0]
+        except Exception:
+            pass
+        _add(out, text, href, date_text, "minfin", cat)
+        if len(out) >= MAX_PER_PAGE:
+            break
+    return out
+
+async def _gather_all() -> List[Dict]:
+    items: List[Dict] = []
+    async with ClientSession() as session:
+        # Epravda
+        ep_all: List[Dict] = []
+        for p in EP_PAGES:
+            try:
+                html = await _fetch(session, urljoin(EP_BASE, p))
+                ep_all.extend(_parse_epravda(html, p))
+            except Exception as e:
+                log.warning(f"epravda fetch fail {p}: {e}")
+        # Minfin
+        mf_all: List[Dict] = []
+        for p in MF_PAGES:
+            try:
+                html = await _fetch(session, urljoin(MF_BASE, p))
+                mf_all.extend(_parse_minfin(html, p))
+            except Exception as e:
+                log.warning(f"minfin fetch fail {p}: {e}")
+
+    # Дедуп за URL, пріоритет — перша зустріч
+    seen = set()
+    for arr in (ep_all, mf_all):
+        for it in arr:
+            u = it.get("link")
+            if u and u not in seen:
+                seen.add(u)
+                items.append(it)
+
+    # Логи як у твоєму форматі
+    def _summ(src: str):
+        arr = [x for x in items if x["src"] == src]
+        log.info(f"✅ {src} - результат:\n   Унікальних новин: {len(arr)}")
+        # простий зріз по категоріях
+        bycat = {}
+        for x in arr:
+            bycat.setdefault(x["category"], 0)
+            bycat[x["category"]] += 1
+        for c, n in sorted(bycat.items(), key=lambda kv: -kv[1])[:5]:
+            log.info(f"   {src}:{c} — {n}")
+
+    log.info("🔹 Парсимо Epravda/Minfin...")
+    _summ("epravda")
+    _summ("minfin")
+    return items
+
+def run_all() -> List[Dict]:
+    """
+    СИНХРОННА обгортка, яка ПОВЕРТАЄ список елементів:
+    {
+      'title': str,
+      'link': str,
+      'published': str,
+      'src': 'epravda'|'minfin',
+      'category': str
     }
-
-def _collect(parse_fn):
-    raw = parse_fn() or []
-    sanitized = []
-    for it in raw:
-        s = _sanitize_item(it)
-        if s: sanitized.append(s)
-    return sanitized, len(raw)
-
-def run_all():
-    # Збір
-    epravda_list, epravda_raw = _collect(parse_epravda)
-    minfin_list,  minfin_raw  = _collect(parse_minfin)
-
-    # Дедуп за URL всередині джерела
-    def dedup_by_url(items):
-        seen = set()
-        out = []
-        for n in items:
-            u = n["url"]
-            if u in seen: 
-                continue
-            seen.add(u)
-            out.append(n)
-        return out
-
-    epravda_unique = dedup_by_url(epravda_list)
-    minfin_unique  = dedup_by_url(minfin_list)
-
-    items = epravda_unique + minfin_unique
-    stats = {
-        "epravda": {"raw": epravda_raw, "unique": len(epravda_unique)},
-        "minfin":  {"raw": minfin_raw,  "unique": len(minfin_unique)},
-    }
-    return {"items": items, "stats": stats}
+    """
+    return asyncio.run(_gather_all())
