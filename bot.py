@@ -1,16 +1,20 @@
 import os
+import re
 import asyncio
 import logging
-from collections import defaultdict
+from typing import Any, Iterable
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
-from groups.easy_sources import run_all  # sync
 
+from groups.easy_sources import run_all  # синхронний збір парсерами
+
+# ── Логування ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("news-bot")
 
+# ── ENV / Константи ────────────────────────────────────────────────────────────
 BOT_TOKEN   = os.getenv("BOT_TOKEN",   "8392167879:AAG9GgPCXrajvdZca5vJcYopk3HO5w2hBhE")
 ADMIN_ID    = int(os.getenv("ADMIN_ID", "6680030792"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://universal-bot-live.onrender.com")
@@ -19,30 +23,39 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
 TELEGRAM_HARD_LIMIT = 4096
-CHUNK_LIMIT = 3000
-MAX_PER_SOURCE = 8           # жорстка “кришка”
-MAX_SOURCES = 2              # epravda + minfin
-SEND_DELAY = 0.4
-RETRY_LIMIT = 4
+CHUNK_LIMIT   = 3000           # запас від ліміту Telegram
+MAX_PER_SRC   = 8              # максимум пунктів на джерело
+MAX_SOURCES   = 2              # epravda + minfin
+SEND_DELAY    = 0.35           # антифлуд
+RETRY_LIMIT   = 4
 
 running_tasks: dict[int, asyncio.Task] = {}
 
-def _safe(s): return s if s else "—"
+# ── Утиліти ────────────────────────────────────────────────────────────────────
+def _safe(s: Any, default: str = "—") -> str:
+    if not s:
+        return default
+    return str(s).strip()
 
-def _chunk_text(text: str, limit: int = CHUNK_LIMIT):
+def _domain_from_url(u: str) -> str:
+    m = re.search(r"https?://([^/]+)/?", u or "", flags=re.I)
+    return (m.group(1) if m else "").lower()
+
+def _chunk_text(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
     lines = text.splitlines(keepends=True)
-    out, cur = [], ""
+    chunks, cur = [], ""
     for ln in lines:
         if len(cur) + len(ln) > limit:
-            out.append(cur.rstrip())
+            if cur.strip():
+                chunks.append(cur.rstrip())
             cur = ln
         else:
             cur += ln
     if cur.strip():
-        out.append(cur.rstrip())
-    return out or ["—"]
+        chunks.append(cur.rstrip())
+    return chunks or ["—"]
 
 async def _send_with_retry(chat_id: int, text: str):
     tries = 0
@@ -51,80 +64,152 @@ async def _send_with_retry(chat_id: int, text: str):
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
             return
         except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.5)
-        except TelegramAPIError:
+            await asyncio.sleep(float(e.retry_after) + 0.6)
+        except TelegramAPIError as e:
             tries += 1
             if tries >= RETRY_LIMIT:
                 raise
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(1.2)
 
 async def _send_chunks(chat_id: int, text: str):
-    chunks = _chunk_text(text, CHUNK_LIMIT)
-    total = len(chunks)
-    for i, ch in enumerate(chunks, 1):
-        prefix = f"🧩 Блок {i}/{total}\n" if total > 1 else ""
-        await _send_with_retry(chat_id, prefix + ch)
+    parts = _chunk_text(text, CHUNK_LIMIT)
+    n = len(parts)
+    for i, p in enumerate(parts, 1):
+        prefix = f"Блок {i}/{n}\n" if n > 1 else ""
+        await _send_with_retry(chat_id, prefix + p)
         await asyncio.sleep(SEND_DELAY)
 
-def _format_blocks(results: list[dict]) -> list[str]:
-    # нормалізація
-    items = []
-    for it in results or []:
-        if not isinstance(it, dict):
-            continue
-        title = _safe(it.get("title"))
-        url   = _safe(it.get("url"))
-        date  = _safe(it.get("date"))
-        src   = (it.get("source") or "").strip().lower()
-        sec   = (it.get("section") or "").strip().lower()
-        # дозволяємо лише ці джерела; якщо парсер не дав source — виведемо у “—”
-        if src not in ("epravda", "minfin"):
-            if "epravda.com.ua" in url:
-                src = "epravda"
-            elif "minfin.com.ua" in url:
-                src = "minfin"
-            else:
-                continue
-        items.append({"title": title, "url": url, "date": date, "source": src or "—", "section": sec or "—"})
+# ── Нормалізація результатів парсерів ─────────────────────────────────────────
+_KEY_ALIASES = {
+    "title":   ("title", "name", "headline", "text"),
+    "url":     ("url", "link", "href"),
+    "date":    ("date", "published", "time", "dt"),
+    "source":  ("source", "src", "site", "origin"),
+    "section": ("section", "category", "sec", "tag", "path"),
+}
 
+def _get_first(d: dict, keys: Iterable[str]) -> Any:
+    for k in keys:
+        if k in d and d[k]:
+            return d[k]
+    return None
+
+def _normalize_item(it: Any) -> dict | None:
+    """Повертає уніфікований елемент або None, якщо не вдалось."""
+    if not isinstance(it, dict):
+        return None
+
+    title = _safe(_get_first(it, _KEY_ALIASES["title"]))
+    url   = _safe(_get_first(it, _KEY_ALIASES["url"]))
+    date  = _safe(_get_first(it, _KEY_ALIASES["date"]))
+    src   = _safe(_get_first(it, _KEY_ALIASES["source"]))
+    sec   = _safe(_get_first(it, _KEY_ALIASES["section"]))
+
+    # Якщо source відсутній — визначимо за доменом
+    if not src or src == "—":
+        dom = _domain_from_url(url)
+        if "epravda.com.ua" in dom:
+            src = "epravda"
+        elif "minfin.com.ua" in dom:
+            src = "minfin"
+
+    # Відсіюємо все, що не epravda/minfin або без URL/Title
+    if not url or not title:
+        return None
+    if src not in ("epravda", "minfin"):
+        dom = _domain_from_url(url)
+        if "epravda.com.ua" in dom:
+            src = "epravda"
+        elif "minfin.com.ua" in dom:
+            src = "minfin"
+        else:
+            return None
+
+    if not sec or sec == "—":
+        # Секцію беремо з шляху (news, finances, biznes, …)
+        m = re.search(r"https?://[^/]+/([a-z\-]+)/", url, flags=re.I)
+        sec = (m.group(1) if m else "news").lower()
+
+    return {"title": title, "url": url, "date": date, "source": src, "section": sec}
+
+def _flatten_results(results: Any) -> list[dict]:
+    """
+    Підтримує формати:
+    - list[dict]
+    - tuple(list[dict], any)
+    - dict[str, list[dict]]   (map source/section → items)
+    - будь-що інше → порожньо
+    """
+    try:
+        # tuple/list з першим елементом як колекція
+        if isinstance(results, tuple) and results:
+            cand = results[0]
+            results = cand
+
+        if isinstance(results, dict):
+            pool = []
+            for _, v in results.items():
+                if isinstance(v, list):
+                    pool.extend(v)
+            results = pool
+
+        if isinstance(results, list):
+            out = []
+            for it in results:
+                norm = _normalize_item(it)
+                if norm:
+                    out.append(norm)
+            return out
+    except Exception:
+        log.exception("Normalize failed")
+
+    return []
+
+def _format_blocks(items: list[dict]) -> list[str]:
     if not items:
         return ["⚠️ Новини за сьогодні/вчора не знайдено."]
 
-    # групування: source -> section -> list
-    from collections import defaultdict as dd
-    by_src: dict[str, dict[str, list[dict]]] = dd(lambda: dd(list))
+    # групуємо: source -> section -> items
+    from collections import defaultdict
+    grouped: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     for it in items:
-        by_src[it["source"]][it["section"]].append(it)
+        grouped[it["source"]][it["section"]].append(it)
 
     blocks = []
     for src in ["epravda", "minfin"][:MAX_SOURCES]:
-        if src not in by_src:
+        if src not in grouped:
             continue
-        total_src = sum(len(v) for v in by_src[src].values())
-        lines = [f"✅ {src} — показую {MAX_PER_SOURCE} з {total_src}\n"]
-        # секції за спаданням розміру
-        count = 0
-        for section, arr in sorted(by_src[src].items(), key=lambda kv: -len(kv[1])):
-            if count >= MAX_PER_SOURCE:
+        total_src = sum(len(v) for v in grouped[src].values())
+        cap = min(total_src, MAX_PER_SRC)
+        lines = [f"✅ {src} — показую {cap} з {total_src}\n"]
+        shown = 0
+        # найбільші секції — першими
+        for section, arr in sorted(grouped[src].items(), key=lambda kv: -len(kv[1])):
+            if shown >= cap:
                 break
-            remain = MAX_PER_SOURCE - count
-            take = arr[:remain]
+            take = arr[: max(0, cap - shown)]
             lines.append(f"Джерело: {src} | секція: {section} — {len(arr)} новин:")
             for i, n in enumerate(take, 1):
-                lines.append(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
-                count += 1
+                lines.append(f"{i}. {n['title']} ({_safe(n['date'])})\n   {n['url']}")
+                shown += 1
+                if shown >= cap:
+                    break
             lines.append("")
-        txt = "\n".join(lines).strip()
-        blocks.append(txt if txt else f"✅ {src}: нічого показати")
+        blocks.append("\n".join(lines).strip())
 
     return blocks or ["⚠️ Порожньо."]
 
+# ── Бізнес-логіка ──────────────────────────────────────────────────────────────
 async def _do_news(chat_id: int):
     try:
-        results = await asyncio.to_thread(run_all)          # не блокуємо loop
-        blocks = _format_blocks(results)                    # 1–2 компактні блоки
+        raw = await asyncio.to_thread(run_all)    # не блокуємо loop
+        items = _flatten_results(raw)
+        log.info(f"normalize: got {len(items)} items after flatten")
+        blocks = _format_blocks(items)
+
         for b in blocks:
             await _send_chunks(chat_id, b)
+
         await _send_with_retry(chat_id, "✅ Готово.")
     except Exception as e:
         log.exception("news task failed")
@@ -133,17 +218,18 @@ async def _do_news(chat_id: int):
         except Exception:
             pass
 
+# ── Хендлери ──────────────────────────────────────────────────────────────────
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
         "👋 Привіт! Доступні команди:\n"
-        "• /news_easy — Epravda + Minfin (згруповано, без превʼю, з лімітами)"
+        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)"
     )
 
 @dp.message(Command("news_easy"))
 async def news_easy_cmd(message: types.Message):
     chat_id = message.chat.id
-    await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10–20 секунд.")
+    await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд.")
 
     old = running_tasks.get(chat_id)
     if old and not old.done():
@@ -152,16 +238,15 @@ async def news_easy_cmd(message: types.Message):
 
     task = asyncio.create_task(_do_news(chat_id))
     running_tasks[chat_id] = task
-    def _cleanup(_):
-        running_tasks.pop(chat_id, None)
-    task.add_done_callback(_cleanup)
+    task.add_done_callback(lambda _: running_tasks.pop(chat_id, None))
 
+# ── AIOHTTP ────────────────────────────────────────────────────────────────────
 async def handle_health(_: web.Request):
     return web.json_response({"status": "alive"})
 
 async def handle_webhook(request: web.Request):
     data = await request.json()
-    await dp.feed_webhook_update(bot, data)  # швидко повертаємо OK
+    await dp.feed_webhook_update(bot, data)  # миттєво відповідаємо 200 OK
     return web.Response(text="OK")
 
 async def on_startup(app: web.Application):
