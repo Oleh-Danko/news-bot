@@ -1,11 +1,12 @@
-# bot.py
 import os
 import logging
+from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from groups.easy_sources import run_all
 
+# --------- базові налаштування ---------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("news-bot")
 
@@ -16,89 +17,107 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://universal-bot-live.onrender.com"
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# ---------- Хелпери форматування ----------
-def _group_by_source_section(items):
-    grouped = {}
-    for n in items:
-        src = n.get("source", "unknown")
-        sec = n.get("section", "root")
-        key = (src, sec)
-        grouped.setdefault(key, {"section_url": n.get("section_url",""), "items": []})
-        grouped[key]["items"].append(n)
-    return grouped
+# --------- хелпери форматування/відправки ---------
+CHUNK_LIMIT = 3500           # запас до 4096
+PER_SECTION_LIMIT = 12       # не більше N пунктів на секцію
+PER_SOURCE_LIMIT  = 60       # “стеля” на джерело (щоб точно не впертися в ліміт)
 
-def _make_header_for_source(source: str, stats: dict) -> str:
-    s = stats.get(source, {"raw": 0, "unique": 0})
-    return (
-        f"✅ {source} — результат:\n"
-        f"Усього знайдено: {s['raw']} (з урахуванням дублів)\n"
-        f"Унікальних новин: {s['unique']}\n\n"
-    )
+def _safe_str(v):
+    return "" if v is None else str(v).strip()
 
-def _format_groups(grouped_for_source: dict) -> str:
-    lines = []
-    for (src, sec), payload in grouped_for_source.items():
-        section_url = payload.get("section_url") or ""
-        items = payload["items"]
-        lines.append(f"Джерело: {section_url} — {len(items)} новин:")
-        for i, n in enumerate(items, 1):
-            title = n.get("title","—")
-            date  = n.get("date","—")
-            url   = n.get("url","")
-            lines.append(f"{i}. {title} ({date})\n   {url}")
-        lines.append("")  # порожній рядок між групами
-    return "\n".join(lines).rstrip()
+def _sanitize_item(d: dict) -> dict:
+    """Гарантовано повертає словник з потрібними ключами або {} якщо нема URL."""
+    url = _safe_str(d.get("url"))
+    if not url:
+        return {}
+    return {
+        "title":  _safe_str(d.get("title") or "—"),
+        "date":   _safe_str(d.get("date")  or "—"),
+        "url":    url,
+        "source": _safe_str(d.get("source") or "epravda").lower(),
+        "section":_safe_str(d.get("section") or ""),
+        "section_url": _safe_str(d.get("section_url") or ""),
+    }
 
-def _build_messages(data: dict, max_items_per_group: int | None = None) -> list[str]:
-    # Групуємо
-    items = data["items"]
-    stats = data["stats"]
-    grouped = _group_by_source_section(items)
+def _format_block(header: str, lines: list[str]) -> str:
+    body = "\n".join(lines)
+    return f"{header}\n{body}".strip()
 
-    # Порядок виводу джерел
-    sources_order = ["epravda", "minfin"]
-    messages = []
+async def _send_chunks(message: types.Message, text: str):
+    """Розбиває довгі відповіді на безпечні шматки й шле по черзі."""
+    if not text:
+        return
+    # розбивка по абзацах з запасом
+    parts = text.split("\n\n")
+    buf = ""
+    for p in parts:
+        add = (p + "\n\n")
+        if len(buf) + len(add) > CHUNK_LIMIT:
+            await message.answer(buf.rstrip(), disable_web_page_preview=True)
+            buf = add
+        else:
+            buf += add
+    if buf.strip():
+        await message.answer(buf.rstrip(), disable_web_page_preview=True)
 
-    for src in sources_order:
-        # Витягуємо групи цього джерела
-        g_src = {k:v for k,v in grouped.items() if k[0] == src}
-        if not g_src:
+def _build_text(results: list[dict]) -> str:
+    """
+    Групуємо за source -> section, ріжемо за лімітами,
+    формуємо один великий текст (далі його розіб’є _send_chunks).
+    """
+    groups: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+
+    for raw in results:
+        item = _sanitize_item(raw if isinstance(raw, dict) else {})
+        if not item:
             continue
+        src = item["source"] or "epravda"
+        sec = item["section"] or ""
+        groups[src][sec].append(item)
 
-        # Зафіксуємо ліміт на групу (якщо треба)
-        trimmed = {}
-        for key, payload in g_src.items():
-            lst = payload["items"]
-            if max_items_per_group and len(lst) > max_items_per_group:
-                lst = lst[:max_items_per_group]
-            trimmed[key] = {"section_url": payload["section_url"], "items": lst}
+    # формуємо тексти по джерелах
+    out_blocks: list[str] = []
+    for src in ("epravda", "minfin"):  # стабільний порядок
+        if src not in groups:
+            continue
+        # плоский список для ліміту PER_SOURCE_LIMIT
+        flat: list[dict] = []
+        for sec, items in groups[src].items():
+            flat.extend(items)
+        if len(flat) > PER_SOURCE_LIMIT:
+            # підріжемо найстарші хвости
+            flat = flat[:PER_SOURCE_LIMIT]
+            # перезберемо назад у секції по зрізаному списку
+            sec_map: dict[str, list[dict]] = defaultdict(list)
+            for it in flat:
+                sec_map[it["section"]].append(it)
+            groups[src] = sec_map
 
-        # Тіло
-        header = _make_header_for_source(src, stats)
-        body   = _format_groups(trimmed)
-        full   = (header + body).strip()
+        total_found = sum(len(v) for v in groups[src].values())
+        total_unique = total_found  # дублікати вже прибрано в run_all()
 
-        # Чанкуємо за 3800 символів по абзацах
-        messages.extend(_chunk_text(full, limit=3800))
-    return messages
+        header = f"✅ {src} — результат:\nУсього знайдено: {total_found} (з урахуванням дублів)\nУнікальних новин: {total_unique}"
+        lines: list[str] = [header, ""]
 
-def _chunk_text(text: str, limit: int = 3800) -> list[str]:
-    parts = []
-    current = []
-    length = 0
-    for para in text.split("\n\n"):
-        add = (para + "\n\n")
-        if length + len(add) > limit and current:
-            parts.append("".join(current).rstrip())
-            current, length = [], 0
-        current.append(add)
-        length += len(add)
-    if current:
-        parts.append("".join(current).rstrip())
-    # Гарантія хоч чогось
-    return parts or [text[:limit]]
+        # секції у стабільному порядку
+        for sec_name in sorted(groups[src].keys()):
+            sec_items = groups[src][sec_name][:PER_SECTION_LIMIT]
+            if not sec_items:
+                continue
+            sec_link = sec_items[0].get("section_url") or sec_name or "-"
+            lines.append(f"Джерело: {sec_link} — {len(sec_items)} новин:")
+            for i, n in enumerate(sec_items, 1):
+                t = n["title"] or "—"
+                d = n["date"] or "—"
+                u = n["url"]
+                lines.append(f"{i}. {t} ({d})\n   {u}")
+            lines.append("")  # порожній рядок між секціями
 
-# ---------- Команди ----------
+        out_blocks.append("\n".join(lines).rstrip())
+
+    return "\n\n".join(b for b in out_blocks if b).strip()
+
+# --------- хендлери ---------
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
@@ -110,14 +129,16 @@ async def start_cmd(message: types.Message):
 async def news_easy_cmd(message: types.Message):
     await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10 секунд.")
     try:
-        data = run_all()  # {"items": [...], "stats": {...}}
-        msgs = _build_messages(data, max_items_per_group=None)  # повний вивід
-        for m in msgs:
-            await message.answer(m, disable_web_page_preview=True)
+        results = run_all()
+        if not results:
+            await message.answer("⚠️ Новини не знайдено.")
+            return
+        text = _build_text(results)
+        await _send_chunks(message, text)
     except Exception as e:
         await message.answer(f"❌ Помилка під час збору новин: {e}")
 
-# ---------- AIOHTTP + Webhook ----------
+# --------- AIOHTTP + Webhook ---------
 async def handle_health(request: web.Request):
     return web.json_response({"status": "alive"})
 
