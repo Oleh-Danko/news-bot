@@ -1,195 +1,180 @@
 import os
-import logging
 import asyncio
+import logging
 from collections import defaultdict
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest, TelegramAPIError
-from parsers.epravda_parser import parse_epravda
-from parsers.minfin_parser import parse_minfin
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from groups.easy_sources import run_all  # синхронний парсер
 
+# ----------------- ЛОГИ -----------------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("news-bot")
 
+# ----------------- ENV ------------------
 BOT_TOKEN   = os.getenv("BOT_TOKEN",   "8392167879:AAG9GgPCXrajvdZca5vJcYopk3HO5w2hBhE")
 ADMIN_ID    = int(os.getenv("ADMIN_ID", "6680030792"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://universal-bot-live.onrender.com")
 
+# ----------------- AIROGRAM --------------
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 
-# Обмеження, щоб не впиратися у ліміти Telegram
-CHUNK_LIMIT        = 3000     # символів у повідомленні
-PER_SECTION_LIMIT  = 5        # макс. новин у розділі
-PER_SOURCE_LIMIT   = 20       # макс. новин із джерела (сума по розділах)
-GLOBAL_MAX_CHUNKS  = 8        # макс. повідомлень у відповідь
-SEND_PAUSE_SEC     = 0.2      # пауза між повідомленнями (антифлуд)
+# ====== КОНСТАНТИ ВІДПРАВКИ ======
+TELEGRAM_HARD_LIMIT = 4096
+CHUNK_LIMIT = 3500                   # запас під службові символи
+MAX_PER_SOURCE = 12                  # не більше 12 новин на джерело
+MAX_SOURCES = 2                      # показуємо лише epravda і minfin
+SEND_DELAY = 0.4                     # пауза між повідомленнями
+RETRY_LIMIT = 4
 
-def _s(v): return "" if v is None else str(v).strip()
+# Щоб не запускати одночасно кілька важких задач на один чат
+running_tasks: dict[int, asyncio.Task] = {}
 
-def _sanitize_item(d: dict) -> dict:
-    if not isinstance(d, dict): return {}
-    url = _s(d.get("url"))
-    if not url: return {}
-    return {
-        "title": _s(d.get("title") or "—"),
-        "date":  _s(d.get("date") or "—"),
-        "url":   url,
-        "source": _s(d.get("source") or "epravda").lower(),
-        "section": _s(d.get("section") or ""),
-        "section_url": _s(d.get("section_url") or ""),
-    }
+# ------------ УТИЛІТИ ------------
+def _safe(s):
+    return s if s else "—"
 
-def _format_sources(results: list[dict]) -> str:
-    # групування: source -> section -> [items]
-    groups: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
-    for raw in results:
-        it = _sanitize_item(raw)
-        if it:
-            groups[it["source"]][it["section"]].append(it)
+def _chunk_text(text: str, limit: int = CHUNK_LIMIT):
+    lines = text.splitlines(keepends=True)
+    out, cur = [], ""
+    for ln in lines:
+        if len(cur) + len(ln) > limit:
+            out.append(cur.rstrip())
+            cur = ln
+        else:
+            cur += ln
+    if cur.strip():
+        out.append(cur.rstrip())
+    return out if out else ["—"]
 
-    blocks: list[str] = []
-    for src in ("epravda", "minfin"):
-        if src not in groups: continue
-
-        # зріз до PER_SOURCE_LIMIT
-        flat = [it for sec in groups[src].values() for it in sec]
-        if len(flat) > PER_SOURCE_LIMIT:
-            keep = set()
-            trimmed_map: dict[str, list[dict]] = defaultdict(list)
-            taken = 0
-            # рівномірно проходимо по секціях поки не назбираємо ліміт
-            for sec_name, items in groups[src].items():
-                for it in items:
-                    if taken >= PER_SOURCE_LIMIT: break
-                    key = it["url"]
-                    if key in keep: continue
-                    keep.add(key); trimmed_map[sec_name].append(it); taken += 1
-                if taken >= PER_SOURCE_LIMIT: break
-            groups[src] = trimmed_map
-
-        total_found  = sum(len(v) for v in groups[src].values())
-        total_unique = total_found
-
-        lines = [
-            f"✅ {src} — результат:",
-            f"Усього знайдено: {total_found} (з урахуванням дублів)",
-            f"Унікальних новин: {total_unique}",
-            ""
-        ]
-        for sec_name in sorted(groups[src].keys()):
-            sec_items = groups[src][sec_name][:PER_SECTION_LIMIT]
-            if not sec_items: continue
-            sec_link = sec_items[0].get("section_url") or (sec_name or "-")
-            lines.append(f"Джерело: {sec_link} — {len(sec_items)} новин:")
-            for i, n in enumerate(sec_items, 1):
-                t = n.get("title") or "—"
-                d = n.get("date") or "—"
-                u = n.get("url") or ""
-                lines.append(f"{i}. {t} ({d})")
-                lines.append(f"   {u}")
-            lines.append("")
-        blocks.append("\n".join(lines).rstrip())
-
-    return "\n\n".join([b for b in blocks if b]).strip()
-
-def _hard_wrap(s: str, limit: int):
-    if len(s) <= limit: return [s]
-    return [s[i:i+limit] for i in range(0, len(s), limit)]
-
-def _chunk_iter(text: str, limit: int):
-    if not text: return
-    produced = 0
-    for para in text.split("\n\n"):
-        if not para: continue
-        if produced >= GLOBAL_MAX_CHUNKS: break
-        if len(para) <= limit:
-            yield para; produced += 1; continue
-        current = ""
-        for raw in para.split("\n"):
-            for piece in _hard_wrap(raw, limit):
-                add = piece + "\n"
-                if len(current) + len(add) > limit:
-                    if current.strip():
-                        yield current.rstrip(); produced += 1
-                        if produced >= GLOBAL_MAX_CHUNKS: return
-                    current = add
-                else:
-                    current += add
-        if current.strip() and produced < GLOBAL_MAX_CHUNKS:
-            yield current.rstrip(); produced += 1
-    if produced >= GLOBAL_MAX_CHUNKS:
-        yield "…та інше. Стиснув результат, щоб уникнути лімітів Telegram."
-
-async def _safe_send(chat_id: int, text: str):
-    try:
-        await bot.send_message(chat_id, text, disable_web_page_preview=True)
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
+async def _send_with_retry(chat_id: int, text: str):
+    tries = 0
+    while True:
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
-        except Exception as ex:
-            log.warning(f"Send after retry failed: {ex}")
-    except (TelegramBadRequest, TelegramAPIError) as e:
-        log.warning(f"Telegram error: {e}")
-    except Exception as e:
-        log.warning(f"Send failed: {e}")
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TelegramAPIError:
+            tries += 1
+            if tries >= RETRY_LIMIT:
+                raise
+            await asyncio.sleep(1.0)
 
-async def _send_long_chat(chat_id: int, text: str):
-    for chunk in _chunk_iter(text, CHUNK_LIMIT):
-        await _safe_send(chat_id, chunk)
-        await asyncio.sleep(SEND_PAUSE_SEC)
+async def _send_chunks(chat_id: int, text: str):
+    chunks = _chunk_text(text, CHUNK_LIMIT)
+    total = len(chunks)
+    for i, ch in enumerate(chunks, 1):
+        hdr = f"🧩 Блок {i}/{total}\n" if total > 1 else ""
+        await _send_with_retry(chat_id, hdr + ch)
+        await asyncio.sleep(SEND_DELAY)
 
-async def _run_parse(func, timeout_s: float, name: str):
-    async def _wrapped(): return await asyncio.to_thread(func)
+def _format_grouped(results: list[dict]) -> list[str]:
+    """
+    Повертає готові блоки тексту для відправки (1–2 блоки).
+    Групуємо за source → section. Ріжемо до MAX_PER_SOURCE.
+    """
+    # Нормалізація
+    items = []
+    for it in results or []:
+        if not isinstance(it, dict):
+            continue
+        title = _safe(it.get("title"))
+        url   = _safe(it.get("url"))
+        date  = _safe(it.get("date"))
+        src   = (it.get("source") or "").strip().lower()
+        sec   = (it.get("section") or "").strip().lower()
+        if src not in ("epravda", "minfin"):
+            # Максимум два джерела — інші відкидаємо
+            continue
+        items.append({"title": title, "url": url, "date": date, "source": src or "—", "section": sec or "—"})
+
+    # Групування: source → section → list
+    by_src: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for it in items:
+        by_src[it["source"]][it["section"]].append(it)
+
+    # Будуємо максимум для двох джерел у фіксованому порядку
+    blocks: list[str] = []
+    order = ["epravda", "minfin"]
+    for src in order[:MAX_SOURCES]:
+        if src not in by_src:
+            continue
+        total_src = sum(len(v) for v in by_src[src].values())
+        lines = [f"✅ {src} — максимум {MAX_PER_SOURCE} з {total_src}\n"]
+        count = 0
+        # Відсортуємо секції за кількістю
+        for section, arr in sorted(by_src[src].items(), key=lambda kv: -len(kv[1])):
+            if count >= MAX_PER_SOURCE:
+                break
+            lines.append(f"Джерело: {src} | секція: {section} — {len(arr)} новин:")
+            # Обрізаємо до доступного ліміту
+            for i, n in enumerate(arr, 1):
+                if count >= MAX_PER_SOURCE:
+                    break
+                lines.append(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
+                count += 1
+            lines.append("")  # порожній рядок після секції
+
+        text = "\n".join(lines).strip()
+        blocks.append(text)
+
+    if not blocks:
+        blocks = ["⚠️ Новини за сьогодні/вчора не знайдено."]
+
+    return blocks
+
+async def _do_news(chat_id: int):
     try:
-        return await asyncio.wait_for(_wrapped(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        log.warning(f"{name}: timeout {timeout_s}s"); return []
+        # 1) Отримуємо дані без блокування loop
+        results = await asyncio.to_thread(run_all)
+
+        # 2) Форматуємо в 1–2 компактні блоки
+        blocks = _format_grouped(results)
+
+        # 3) Відправляємо без перевищення лімітів
+        for b in blocks:
+            await _send_chunks(chat_id, b)
+
+        await _send_with_retry(chat_id, "✅ Готово.")
     except Exception as e:
-        log.warning(f"{name}: failed: {e}"); return []
+        log.exception("news task failed")
+        try:
+            await _send_with_retry(chat_id, f"❌ Помилка: {e}")
+        except Exception:
+            pass
 
-async def collect_news_concurrent() -> list[dict]:
-    e_task = asyncio.create_task(_run_parse(parse_epravda, 8, "epravda"))
-    m_task = asyncio.create_task(_run_parse(parse_minfin,  8, "minfin"))
-    epravda, minfin = await asyncio.gather(e_task, m_task, return_exceptions=False)
-
-    seen, out = set(), []
-    for it in (epravda or []) + (minfin or []):
-        if not isinstance(it, dict): continue
-        url = (it.get("url") or "").strip()
-        if not url or url in seen: continue
-        seen.add(url); out.append(it)
-    return out
-
+# ------------- ХЕНДЛЕРИ -------------
 @dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer("👋 Привіт! Доступні команди:\n• /news_easy — Epravda + Minfin (унікальні, без прев’ю)")
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Привіт! Доступні команди:\n"
+        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)"
+    )
 
 @dp.message(Command("news_easy"))
-async def news_easy_cmd(message: types.Message):
-    await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10 секунд.")
+async def cmd_news_easy(message: types.Message):
     chat_id = message.chat.id
-    async def _job():
-        try:
-            results = await collect_news_concurrent()
-            if not results:
-                await _safe_send(chat_id, "⚠️ Джерела не відповіли вчасно або новин нема.")
-                return
-            text = _format_sources(results)
-            await _send_long_chat(chat_id, text)
-        except Exception as e:
-            await _safe_send(chat_id, f"❌ Помилка під час збору новин: {e}")
-    asyncio.create_task(_job())  # не блокуємо вебхук
+    await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд.")
 
-async def handle_health(request: web.Request):
+    # Якщо вже є жива задача на цей чат — не стартуємо другу
+    task = running_tasks.get(chat_id)
+    if task and not task.done():
+        await message.answer("🟡 Запит уже виконується. Дочекайся завершення.")
+        return
+
+    running_tasks[chat_id] = asyncio.create_task(_do_news(chat_id))
+
+# ---------- AIOHTTP + Webhook ----------
+async def handle_health(_: web.Request):
     return web.json_response({"status": "alive"})
 
 async def handle_webhook(request: web.Request):
     data = await request.json()
-    # миттєвий ACK вебхуку; обробку робимо у фоні
-    asyncio.create_task(dp.feed_webhook_update(bot, data))
+    # feed_webhook_update сам викликає хендлери; наші хендлери тепер миттєво створюють бекграунд-таск і завершуються
+    await dp.feed_webhook_update(bot, data)
     return web.Response(text="OK")
 
 async def on_startup(app: web.Application):
@@ -199,8 +184,10 @@ async def on_startup(app: web.Application):
 
 async def on_shutdown(app: web.Application):
     log.info("🔻 Deleting webhook & closing session…")
-    try: await bot.delete_webhook(drop_pending_updates=True)
-    finally: await bot.session.close()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    finally:
+        await bot.session.close()
     log.info("✅ Shutdown complete")
 
 def make_app() -> web.Application:
