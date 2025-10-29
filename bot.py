@@ -15,14 +15,14 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 # ====== Конфіг ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()  # має вигляд: https://universal-bot-live.onrender.com
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip()
 
 assert BOT_TOKEN, "BOT_TOKEN is required"
 assert WEBHOOK_URL, "WEBHOOK_URL is required"
 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-MAX_CHARS_PER_MSG = 3800           # безпечна межа <4096
-PAUSE_BETWEEN_MSGS_SEC = 0.06      # антифлуд
+MAX_CHARS_PER_MSG = 3800
+PAUSE_BETWEEN_MSGS_SEC = 0.06
 SOURCE_ORDER = ["epravda", "minfin"]
 
 # ====== Логи ======
@@ -34,9 +34,6 @@ logging.basicConfig(
 log = logging.getLogger("news-bot")
 
 # ====== Імпорт парсера ======
-# Очікується, що groups/easy_sources.py має функцію run_all(), яка повертає:
-# 1) або dict: {source: List[items]} або {source: {"items": List[items], ...}}
-# 2) або загальний List[items], де кожен item має поля: source, title, url, date (YYYY-MM-DD або %Y-%m-%d), section
 try:
     from groups.easy_sources import run_all as parse_all_sources
 except Exception as e:
@@ -49,34 +46,51 @@ def _norm_date(s: Any) -> str:
         return ""
     if isinstance(s, datetime):
         return s.strftime("%Y-%m-%d")
+    s = str(s).strip()
     for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(str(s).strip(), fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except Exception:
             pass
-    # якщо не розпізнали — повертаємо як є
-    return str(s)
+    return s
+
+def _alias_fields(it: Dict[str, Any]) -> Dict[str, Any]:
+    """Уніфікує ключі з парсера: link->url, published->date, src->source, category->section."""
+    x = dict(it) if isinstance(it, dict) else {}
+    if not x.get("url"):
+        if x.get("link"):
+            x["url"] = str(x["link"]).strip()
+    if not x.get("date"):
+        if x.get("published"):
+            x["date"] = _norm_date(x["published"])
+    if not x.get("source"):
+        if x.get("src"):
+            x["source"] = str(x["src"]).strip().lower()
+    if not x.get("section"):
+        if x.get("category"):
+            x["section"] = str(x["category"]).strip().lower()
+    # нормалізація title
+    if x.get("title"):
+        x["title"] = str(x["title"]).strip()
+    return x
 
 def _dedup_by_url(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out = []
     for it in items:
-        url = (it.get("url") or "").strip()
+        url = (it.get("url") or it.get("link") or "").strip()
         if not url or url in seen:
             continue
         seen.add(url)
+        it["url"] = url
         out.append(it)
     return out
 
 def _group_by_source(items_or_map: Any) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Повертає {source: [items]} для будь-якої форми, що прийде з парсера.
-    """
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
-    # Випадок: dict зі списками або dict із ключем "items"
     if isinstance(items_or_map, dict):
-        for src, payload in items_or_map.items():
+        for src_key, payload in items_or_map.items():
             if isinstance(payload, dict) and "items" in payload:
                 arr = payload.get("items") or []
             else:
@@ -84,32 +98,34 @@ def _group_by_source(items_or_map: Any) -> Dict[str, List[Dict[str, Any]]]:
             if not isinstance(arr, list):
                 continue
             for it in arr:
-                if isinstance(it, dict):
-                    it.setdefault("source", src)
-                    grouped[src].append(it)
+                if not isinstance(it, dict):
+                    continue
+                it = _alias_fields(it)
+                it.setdefault("source", str(src_key).strip().lower())
+                grouped[it["source"]].append(it)
         return grouped
 
-    # Випадок: загальний список
     if isinstance(items_or_map, list):
         for it in items_or_map:
             if not isinstance(it, dict):
                 continue
+            it = _alias_fields(it)
             src = (it.get("source") or "").strip().lower() or "unknown"
+            it["source"] = src
             grouped[src].append(it)
         return grouped
 
-    # Інше — порожньо
     return {}
 
 def _sort_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Сортуємо за датою (нові зверху), потім за назвою
     def key(it):
         d = _norm_date(it.get("date"))
         try:
             dt = datetime.strptime(d, "%Y-%m-%d")
+            ts = int(dt.timestamp())
         except Exception:
-            dt = datetime.min
-        return (-int(dt.timestamp()), (it.get("title") or "").lower())
+            ts = -1
+        return (-ts, (it.get("title") or "").lower())
     return sorted(items, key=key)
 
 def _format_lines(items: List[Dict[str, Any]]) -> List[str]:
@@ -119,15 +135,11 @@ def _format_lines(items: List[Dict[str, Any]]) -> List[str]:
         url = (it.get("url") or "").strip()
         d = _norm_date(it.get("date"))
         suffix = f" ({d})" if d else ""
-        # Дві строки на запис: заголовок + посилання з відступом
         lines.append(f"{idx}. {title}{suffix}")
         lines.append(f"   {url}")
     return lines
 
 def _chunk_and_build_messages(header: str, lines: List[str]) -> List[str]:
-    """
-    Розбиває контент на чанки < MAX_CHARS_PER_MSG.
-    """
     messages = []
     cur = header.strip()
     for line in lines:
@@ -143,9 +155,7 @@ def _chunk_and_build_messages(header: str, lines: List[str]) -> List[str]:
 
 async def _safe_send_many(bot: Bot, chat_id: int, messages: List[str]):
     for m in messages:
-        # Telegram hard cap 4096 символів
         if len(m) > 4096:
-            # додаткова перестраховка (не має спрацювати з нашою межою)
             start = 0
             while start < len(m):
                 await bot.send_message(chat_id, m[start:start+3800])
@@ -162,7 +172,7 @@ async def _maybe_await(x):
 
 # ====== Бот/Диспетчер ======
 dp = Dispatcher()
-bot = Bot(BOT_TOKEN, parse_mode=None)  # без HTML/Markdown, щоб не ламати тексти
+bot = Bot(BOT_TOKEN, parse_mode=None)
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -190,16 +200,15 @@ async def cmd_news_easy(message: Message):
             await bot.send_message(chat_id, "✅ Готово.")
             return
 
-        # Порядок джерел фіксуємо, решту додаємо вкінці
         ordered_sources = [s for s in SOURCE_ORDER if s in grouped] + [s for s in grouped.keys() if s not in SOURCE_ORDER]
 
         for source in ordered_sources:
             items = grouped.get(source, [])
-            # Уніфікація: дата/секція/дедуп/сортування
-            for it in items:
-                it["date"] = _norm_date(it.get("date"))
-                it["section"] = (it.get("section") or "").strip().lower()
+            if not items:
+                continue
 
+            # уніфікація, дедуп, сортування
+            items = [_alias_fields(it) for it in items if isinstance(it, dict)]
             items = _dedup_by_url(items)
             items = _sort_items(items)
 
@@ -207,7 +216,6 @@ async def cmd_news_easy(message: Message):
             if total == 0:
                 continue
 
-            # Формуємо лінії і чанкi
             header = f"✅ {source} — показую {total} з {total}"
             lines = _format_lines(items)
             messages = _chunk_and_build_messages(header, lines)
@@ -229,8 +237,6 @@ async def health(request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", health)
-
-    # Webhook handler
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     return app
@@ -239,5 +245,4 @@ def build_app() -> web.Application:
 app = build_app()
 
 if __name__ == "__main__":
-    # Локальний запуск (Render викликає так само)
     web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
