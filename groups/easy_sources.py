@@ -21,14 +21,8 @@ TZ = ZoneInfo("Europe/Kyiv")
 EP_BASE = "https://epravda.com.ua"
 MF_BASE = "https://minfin.com.ua"
 
-EP_PAGES = [
-    "/finances",
-]
-MF_PAGES = [
-    "/ua/news",
-    "/ua/news/money-management/",
-    "/ua/news/commerce/",
-]
+EP_PAGES = ["/finances"]
+MF_PAGES = ["/ua/news", "/ua/news/money-management/", "/ua/news/commerce/"]
 
 MAX_PER_PAGE = 60
 
@@ -101,25 +95,68 @@ async def _fetch(session: ClientSession, url: str) -> str:
 def _parse_epravda(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict] = []
-    for a in soup.select("a.item__title, article a.article__title, article a.list-item__title"):
-        href = a.get("href") or ""
-        if href.startswith("/"):
-            href = urljoin(EP_BASE, href)
-        title = a.get_text(strip=True)
-        date_text = ""
-        parent = a.find_parent(["article", "div", "li"])
-        if parent:
-            dt = parent.select_one("time, .article__date, .list-item__date")
-            if dt:
-                date_text = dt.get_text(" ", strip=True)
-        cat = "news"
-        try:
-            cat = href.split(EP_BASE)[-1].split("/")[1]
-        except Exception:
-            pass
-        _add(out, title, href, date_text, "epravda", cat)
-        if len(out) >= MAX_PER_PAGE:
-            break
+
+    # 1) основні відомі селектори
+    selectors = [
+        "a.item__title",
+        "article a.article__title",
+        "article a.list-item__title",
+        "h2 a.article__title",
+        "h3 a.article__title",
+    ]
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href") or ""
+            if href.startswith("/"):
+                href = urljoin(EP_BASE, href)
+            if not href.startswith(EP_BASE):
+                continue
+            # беремо лише фінансові/новинні матеріали
+            tail = href.replace(EP_BASE, "")
+            if "/finances" not in tail and "/news" not in tail:
+                continue
+
+            title = a.get_text(strip=True)
+            date_text = ""
+            parent = a.find_parent(["article", "div", "li"])
+            if parent:
+                dt = parent.select_one("time[datetime], time, .article__date, .list-item__date")
+                if dt:
+                    date_text = dt.get_text(" ", strip=True)
+
+            # 2) якщо дати зовсім немає у тизері — ставимо сьогодні (щоб не відсіклося)
+            if not date_text:
+                date_text = datetime.now(TZ).date().isoformat()
+
+            # категорія з URL
+            cat = "news"
+            try:
+                parts = [p for p in tail.split("/") if p]
+                if parts:
+                    cat = parts[0]
+            except Exception:
+                pass
+
+            _add(out, title, href, date_text, "epravda", cat)
+            if len(out) >= MAX_PER_PAGE:
+                return out
+
+    # 3) бекап: будь-які посилання з /finances або /news
+    if not out:
+        for a in soup.select("a[href*='/finances/'], a[href*='/news/']"):
+            href = a.get("href") or ""
+            if href.startswith("/"):
+                href = urljoin(EP_BASE, href)
+            if not href.startswith(EP_BASE):
+                continue
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            date_text = datetime.now(TZ).date().isoformat()
+            _add(out, title, href, date_text, "epravda", "finances")
+            if len(out) >= MAX_PER_PAGE:
+                break
+
     return out
 
 def _parse_minfin(html: str, path: str) -> List[Dict]:
@@ -184,21 +221,11 @@ async def _gather_all() -> List[Dict]:
     items = _only_today_yesterday(items)
     total_after = len(items)
     log.info(f"🔹 Після фільтра дати (сьогодні/вчора): {total_after}")
-
-    def _summ(src: str):
-        arr = [x for x in items if x["src"] == src]
-        log.info(f"✅ {src} — {len(arr)}")
-
-    _summ("epravda")
-    _summ("minfin")
+    log.info(f"✅ epravda — {len([x for x in items if x['src']=='epravda'])}")
+    log.info(f"✅ minfin  — {len([x for x in items if x['src']=='minfin'])}")
     return items
 
 def run_all():
-    """
-    Безпечно працює і в sync, і в async-контексті:
-    - Якщо цикл подій вже запущено (webhook/handler) — повертаємо Task (awaitable).
-    - Якщо ні — запускаємо тимчасовий цикл через asyncio.run().
-    """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
