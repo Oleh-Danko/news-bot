@@ -37,10 +37,8 @@ UA_MONTHS = {
     "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
 }
 
-
 def _norm(s: str) -> str:
     return " ".join(s.split()) if isinstance(s, str) else s
-
 
 def _add(items: List[Dict], title: str, href: str, date_text: str, src: str, category: str):
     if not href or not title:
@@ -53,7 +51,6 @@ def _add(items: List[Dict], title: str, href: str, date_text: str, src: str, cat
         "category": category.strip("/") or "news",
     })
 
-
 def _extract_date_from_url(url: str) -> Optional[date]:
     m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", url)
     if m:
@@ -63,7 +60,6 @@ def _extract_date_from_url(url: str) -> Optional[date]:
         except ValueError:
             return None
     return None
-
 
 def _extract_date_from_text(text: str) -> Optional[date]:
     if not text:
@@ -87,7 +83,6 @@ def _extract_date_from_text(text: str) -> Optional[date]:
                 return None
     return None
 
-
 def _only_today_yesterday(items: List[Dict]) -> List[Dict]:
     today = datetime.now(TZ).date()
     yesterday = today - timedelta(days=1)
@@ -98,12 +93,10 @@ def _only_today_yesterday(items: List[Dict]) -> List[Dict]:
             out.append(it)
     return out
 
-
 async def _fetch(session: ClientSession, url: str) -> str:
     async with session.get(url, headers=HEADERS, timeout=20) as r:
         r.raise_for_status()
         return await r.text()
-
 
 def _parse_epravda(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
@@ -128,7 +121,6 @@ def _parse_epravda(html: str, path: str) -> List[Dict]:
         if len(out) >= MAX_PER_PAGE:
             break
     return out
-
 
 def _parse_minfin(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
@@ -158,7 +150,6 @@ def _parse_minfin(html: str, path: str) -> List[Dict]:
         if len(out) >= MAX_PER_PAGE:
             break
     return out
-
 
 async def _gather_all() -> List[Dict]:
     async with ClientSession() as session:
@@ -202,10 +193,15 @@ async def _gather_all() -> List[Dict]:
     _summ("minfin")
     return items
 
-
-# ✅ Асинхронна версія run_all — без asyncio.run()
-async def run_all() -> List[Dict]:
+def run_all():
     """
-    Асинхронна версія для сумісності з aiogram event loop.
+    Безпечно працює і в sync, і в async-контексті:
+    - Якщо цикл подій вже запущено (webhook/handler) — повертаємо Task (awaitable).
+    - Якщо ні — запускаємо тимчасовий цикл через asyncio.run().
     """
-    return await _gather_all()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_gather_all())
+    else:
+        return loop.create_task(_gather_all())
