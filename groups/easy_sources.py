@@ -22,7 +22,7 @@ EP_BASE = "https://epravda.com.ua"
 MF_BASE = "https://minfin.com.ua"
 
 EP_PAGES = [
-    "/finances",  # беремо лише фінанси; інші розділи можуть підтягуватись перехресними лінками
+    "/finances",
 ]
 MF_PAGES = [
     "/ua/news",
@@ -30,15 +30,17 @@ MF_PAGES = [
     "/ua/news/commerce/",
 ]
 
-MAX_PER_PAGE = 60  # захисна «стеля» зі сторінки
+MAX_PER_PAGE = 60
 
 UA_MONTHS = {
     "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
     "липня": 7, "серпня": 8, "вересня": 9, "жовтня": 10, "листопада": 11, "грудня": 12,
 }
 
+
 def _norm(s: str) -> str:
     return " ".join(s.split()) if isinstance(s, str) else s
+
 
 def _add(items: List[Dict], title: str, href: str, date_text: str, src: str, category: str):
     if not href or not title:
@@ -51,8 +53,8 @@ def _add(items: List[Dict], title: str, href: str, date_text: str, src: str, cat
         "category": category.strip("/") or "news",
     })
 
+
 def _extract_date_from_url(url: str) -> Optional[date]:
-    # minfin: /YYYY/MM/DD/
     m = re.search(r"/(20\d{2})/(\d{2})/(\d{2})/", url)
     if m:
         y, mo, d = map(int, m.groups())
@@ -62,10 +64,10 @@ def _extract_date_from_url(url: str) -> Optional[date]:
             return None
     return None
 
+
 def _extract_date_from_text(text: str) -> Optional[date]:
     if not text:
         return None
-    # 2025-10-28
     m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", text)
     if m:
         y, mo, d = map(int, m.groups())
@@ -73,7 +75,6 @@ def _extract_date_from_text(text: str) -> Optional[date]:
             return date(y, mo, d)
         except ValueError:
             return None
-    # «28 жовтня 2025»
     m = re.search(r"(\d{1,2})\s+([А-Яа-яІіЇїЄєҐґ]+)\s+(20\d{2})", text)
     if m:
         d = int(m.group(1))
@@ -86,6 +87,7 @@ def _extract_date_from_text(text: str) -> Optional[date]:
                 return None
     return None
 
+
 def _only_today_yesterday(items: List[Dict]) -> List[Dict]:
     today = datetime.now(TZ).date()
     yesterday = today - timedelta(days=1)
@@ -96,28 +98,27 @@ def _only_today_yesterday(items: List[Dict]) -> List[Dict]:
             out.append(it)
     return out
 
+
 async def _fetch(session: ClientSession, url: str) -> str:
     async with session.get(url, headers=HEADERS, timeout=20) as r:
         r.raise_for_status()
         return await r.text()
 
+
 def _parse_epravda(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict] = []
-    # типові тайтл-лінки
     for a in soup.select("a.item__title, article a.article__title, article a.list-item__title"):
         href = a.get("href") or ""
         if href.startswith("/"):
             href = urljoin(EP_BASE, href)
         title = a.get_text(strip=True)
-        # шукаємо time/date поряд, якщо є
         date_text = ""
         parent = a.find_parent(["article", "div", "li"])
         if parent:
             dt = parent.select_one("time, .article__date, .list-item__date")
             if dt:
                 date_text = dt.get_text(" ", strip=True)
-        # категорія з URL
         cat = "news"
         try:
             cat = href.split(EP_BASE)[-1].split("/")[1]
@@ -128,10 +129,10 @@ def _parse_epravda(html: str, path: str) -> List[Dict]:
             break
     return out
 
+
 def _parse_minfin(html: str, path: str) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     out: List[Dict] = []
-    # беремо тільки лінки з датою у URL
     for a in soup.select("a[href*='/2025/'], a[href*='/ua/2025/']"):
         href = a.get("href") or ""
         text = a.get_text(strip=True)
@@ -139,12 +140,10 @@ def _parse_minfin(html: str, path: str) -> List[Dict]:
             continue
         if href.startswith("/"):
             href = urljoin(MF_BASE, href)
-        # дата з URL (на minfin це надійніше, ніж текст)
         date_text = ""
         d = _extract_date_from_url(href)
         if d:
             date_text = d.isoformat()
-        # категорія з URL
         cat = "news"
         try:
             tail = href.split(MF_BASE)[-1]
@@ -159,6 +158,7 @@ def _parse_minfin(html: str, path: str) -> List[Dict]:
         if len(out) >= MAX_PER_PAGE:
             break
     return out
+
 
 async def _gather_all() -> List[Dict]:
     async with ClientSession() as session:
@@ -178,7 +178,6 @@ async def _gather_all() -> List[Dict]:
             except Exception as e:
                 log.warning(f"minfin fetch fail {p}: {e}")
 
-    # дедуп за URL
     seen = set()
     items: List[Dict] = []
     for arr in (ep_all, mf_all):
@@ -188,16 +187,13 @@ async def _gather_all() -> List[Dict]:
                 seen.add(u)
                 items.append(it)
 
-    # лог до фільтра
     total_before = len(items)
     log.info(f"🔹 Парсимо Epravda/Minfin... Всього (до фільтра): {total_before}")
 
-    # фільтр тільки «сьогодні/вчора» + відсікаємо без дати
     items = _only_today_yesterday(items)
     total_after = len(items)
     log.info(f"🔹 Після фільтра дати (сьогодні/вчора): {total_after}")
 
-    # короткий зріз по джерелах
     def _summ(src: str):
         arr = [x for x in items if x["src"] == src]
         log.info(f"✅ {src} — {len(arr)}")
@@ -206,14 +202,10 @@ async def _gather_all() -> List[Dict]:
     _summ("minfin")
     return items
 
-def run_all() -> List[Dict]:
+
+# ✅ Асинхронна версія run_all — без asyncio.run()
+async def run_all() -> List[Dict]:
     """
-    Повертає список елементів лише за «сьогодні/вчора».
-    Елемент:
-      title: str
-      link: str
-      published: YYYY-MM-DD або вихідний текст (якщо був)
-      src: 'epravda' | 'minfin'
-      category: str
+    Асинхронна версія для сумісності з aiogram event loop.
     """
-    return asyncio.run(_gather_all())
+    return await _gather_all()
