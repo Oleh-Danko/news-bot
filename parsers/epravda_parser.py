@@ -1,14 +1,11 @@
 # parsers/epravda_parser.py
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from urllib.parse import urljoin
 
 BASE = "https://www.epravda.com.ua"
-SOURCES = [
-    "https://www.epravda.com.ua/finances/",
-    "https://www.epravda.com.ua/columns/",
-]
+FINANCES_URL = "https://www.epravda.com.ua/finances/"
 
 UA_MONTHS = {
     "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
@@ -69,47 +66,13 @@ def _collect_finances(soup: BeautifulSoup) -> list[dict]:
             })
     return items
 
-def _collect_columns(soup: BeautifulSoup) -> list[dict]:
-    items = []
-    for card in soup.select(".article.article_view_sm"):
-        a = card.select_one(".article_title a")
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-        url = urljoin(BASE, a.get("href", "").strip())
-        items.append({
-            "title": title,
-            "url": url,
-            "date": "—",
-            "source": "https://epravda.com.ua/columns",
-            "section": "columns",
-        })
-    for a in soup.select(".article_title a"):
-        title = a.get_text(strip=True)
-        url = urljoin(BASE, a.get("href", "").strip())
-        if not any(x["url"] == url for x in items):
-            items.append({
-                "title": title,
-                "url": url,
-                "date": "—",
-                "source": "https://epravda.com.ua/columns",
-                "section": "columns",
-            })
-    return items
-
 def parse_epravda() -> list[dict]:
     print("🔹 Парсимо Epravda...")
 
-    fin_url = SOURCES[0]
-    col_url = SOURCES[1]
-
-    soup_fin = _fetch(fin_url)
-    soup_col = _fetch(col_url)
-
+    soup_fin = _fetch(FINANCES_URL)
     fin_items = _collect_finances(soup_fin)
-    col_items = _collect_columns(soup_col)
 
-    all_found = fin_items + col_items
+    all_found = fin_items
     seen = set()
     unique = []
     for n in all_found:
@@ -123,11 +86,6 @@ def parse_epravda() -> list[dict]:
 
     print(f"Джерело: https://epravda.com.ua/finances — {len(fin_items)} новин:")
     for i, n in enumerate(fin_items, 1):
-        print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
-    print()
-
-    print(f"Джерело: https://epravda.com.ua/columns — {len(col_items)} новин:")
-    for i, n in enumerate(col_items, 1):
         print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
     print()
 
