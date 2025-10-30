@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 def parse_minfin():
     base_url = "https://minfin.com.ua"
     sections = [
-        "news",
+        "ua/news/",                  # було: "news"
         "ua/news/money-management/",
         "ua/news/commerce/",
         "ua/news/improvement/"
@@ -41,7 +41,7 @@ def parse_minfin():
                 continue
 
             title = title_tag.text.strip()
-            link = title_tag["href"]
+            link = title_tag.get("href", "")
             if not link.startswith("http"):
                 link = base_url + link
 
@@ -51,14 +51,10 @@ def parse_minfin():
             )
 
             try:
-                news_date = datetime.strptime(
-                    raw_date.split()[0], "%Y-%m-%d"
-                ).date()
+                news_date = datetime.strptime(raw_date.split()[0], "%Y-%m-%d").date()
             except Exception:
                 try:
-                    news_date = datetime.strptime(
-                        raw_date.split()[0], "%d.%m.%Y"
-                    ).date()
+                    news_date = datetime.strptime(raw_date.split()[0], "%d.%m.%Y").date()
                 except Exception:
                     continue
 
