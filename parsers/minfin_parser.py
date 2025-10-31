@@ -14,11 +14,11 @@ HEADERS = {
 
 BASE_URL = "https://minfin.com.ua"
 
-SECTIONS = [
-    "ua/news/",                 # ← головна UA-стрічка (замість /news/)
-    "ua/news/money-management/",
+SECTIONS = [       
+    "ua/news/money-management/",    # ← головна UA-стрічка (замість /news/)
     "ua/news/commerce/",
     "ua/news/improvement/",
+    "ua/news/",   
 ]
 
 
