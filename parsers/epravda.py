@@ -5,16 +5,14 @@ def parse_epravda():
 
 
 #КОД
+# parsers/epravda_parser.py
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from urllib.parse import urljoin
 
 BASE = "https://www.epravda.com.ua"
-SOURCES = [
-    "https://www.epravda.com.ua/finances/",
-    "https://www.epravda.com.ua/columns/",
-]
+FINANCES_URL = "https://www.epravda.com.ua/finances/"
 
 UA_MONTHS = {
     "січня": 1, "лютого": 2, "березня": 3, "квітня": 4, "травня": 5, "червня": 6,
@@ -35,16 +33,9 @@ def _fetch(url: str) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "html.parser")
 
 def _parse_ua_date(text: str) -> date | None:
-    """
-    Очікує рядки типу:
-    - '27 жовтня, 12:30'
-    - '26 жовтня, 18:00'
-    Повертає date або None, якщо не вдалось розпарсити.
-    """
     if not text:
         return None
     t = text.strip().lower()
-    # прибираємо все після коми (час)
     if "," in t:
         t = t.split(",", 1)[0].strip()
     parts = t.split()
@@ -52,24 +43,16 @@ def _parse_ua_date(text: str) -> date | None:
         return None
     try:
         day = int(parts[0])
-        month_name = parts[1]
-        month = UA_MONTHS.get(month_name)
+        month = UA_MONTHS.get(parts[1])
         if not month:
             return None
-        # рік на сторінці не вказаний — беремо поточний
-        year = date.today().year
-        return date(year, month, day)
+        return date(date.today().year, month, day)
     except Exception:
         return None
 
 def _collect_finances(soup: BeautifulSoup) -> list[dict]:
-    """
-    З finances беремо ЛИШЕ сьогодні та вчора.
-    Селектори: блоки .article_news (у них є .article_title a і .article_date)
-    """
     today = date.today()
     yesterday = today - timedelta(days=1)
-
     items = []
     for news in soup.select(".article_news"):
         a = news.select_one(".article_title a")
@@ -80,83 +63,23 @@ def _collect_finances(soup: BeautifulSoup) -> list[dict]:
         url = urljoin(BASE, a.get("href", "").strip())
         date_str = d.get_text(strip=True) if d else ""
         dt = _parse_ua_date(date_str)
-
-        # фільтр: тільки сьогодні та вчора
         if dt in (today, yesterday):
             items.append({
                 "title": title,
                 "url": url,
-                "date": dt.strftime("%Y-%m-%d") if dt else "—",
+                "date": dt.strftime("%Y-%m-%d"),
                 "source": "https://epravda.com.ua/finances",
                 "section": "finances",
             })
     return items
 
-def _collect_columns(soup: BeautifulSoup) -> list[dict]:
-    """
-    З columns беремо ВСЕ (дат немає).
-    Типові елементи: .article.article_view_sm або просто .article_title a
-    """
-    items = []
-    # Перший прохід: структуровані картки
-    for card in soup.select(".article.article_view_sm"):
-        a = card.select_one(".article_title a")
-        if not a:
-            continue
-        title = a.get_text(strip=True)
-        url = urljoin(BASE, a.get("href", "").strip())
-        items.append({
-            "title": title,
-            "url": url,
-            "date": "—",
-            "source": "https://epravda.com.ua/columns",
-            "section": "columns",
-        })
-
-    # Додатковий прохід: якщо раптом є заголовки поза .article_view_sm
-    # (щоб не пропустити нічого)
-    for a in soup.select(".article_title a"):
-        title = a.get_text(strip=True)
-        url = urljoin(BASE, a.get("href", "").strip())
-        if not any(x["url"] == url for x in items):
-            items.append({
-                "title": title,
-                "url": url,
-                "date": "—",
-                "source": "https://epravda.com.ua/columns",
-                "section": "columns",
-            })
-
-    return items
-
 def parse_epravda() -> list[dict]:
-    """
-    Повертає список новин (словники) з двох джерел:
-    - finances — тільки сьогодні та вчора,
-    - columns — усі.
-    Також друкує результат у стилі Minfin.
-    """
-    all_found = []
-    per_source_print = []
-
     print("🔹 Парсимо Epravda...")
 
-    # --- FINANCES ---
-    url_fin = SOURCES[0]
-    soup_fin = _fetch(url_fin)
+    soup_fin = _fetch(FINANCES_URL)
     fin_items = _collect_finances(soup_fin)
-    per_source_print.append(("https://epravda.com.ua/finances", fin_items))
 
-    # --- COLUMNS ---
-    url_col = SOURCES[1]
-    soup_col = _fetch(url_col)
-    col_items = _collect_columns(soup_col)
-    per_source_print.append(("https://epravda.com.ua/columns", col_items))
-
-    # Загальний список (з урахуванням дублів)
-    all_found = fin_items + col_items
-
-    # Унікальність за URL
+    all_found = fin_items
     seen = set()
     unique = []
     for n in all_found:
@@ -164,20 +87,14 @@ def parse_epravda() -> list[dict]:
             unique.append(n)
             seen.add(n["url"])
 
-    # Вивід по кожному джерелу (як ти просив)
-    total_with_dups = len(all_found)
-    total_unique = len(unique)
-    print(f"\n✅ epravda - результат:")
-    print(f"   Усього знайдено {total_with_dups} (з урахуванням дублів)")
-    print(f"   Унікальних новин: {total_unique}\n")
+    print("\n✅ epravda - результат:")
+    print(f"   Усього знайдено {len(all_found)} (з урахуванням дублів)")
+    print(f"   Унікальних новин: {len(unique)}\n")
 
-    global_index = 1
-    for src_url, items in per_source_print:
-        print(f"Джерело: {src_url} — {len(items)} новин:")
-        for i, n in enumerate(items, 1):
-            print(f"{global_index}. {n['title']} ({n['date']})\n   {n['url']}")
-            global_index += 1
-        print()  # порожній рядок між джерелами
+    print(f"Джерело: https://epravda.com.ua/finances — {len(fin_items)} новин:")
+    for i, n in enumerate(fin_items, 1):
+        print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
+    print()
 
     return unique
 

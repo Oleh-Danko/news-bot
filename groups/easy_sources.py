@@ -1,29 +1,31 @@
 # groups/easy_sources.py
 import io
 import runpy
-from contextlib import redirect_stdout
-from typing import List
+import contextlib
 
-MODULES = [
-    "parsers.epravda_parser",
-    "parsers.minfin_parser",
-]
-
-def _run_module_capture(modname: str) -> str:
+def _run_and_capture(module_name: str) -> str:
     buf = io.StringIO()
-    # ВАЖЛИВО: без жодної паралельності — суворо послідовно
-    with redirect_stdout(buf):
-        runpy.run_module(modname, run_name="__main__")
+    with contextlib.redirect_stdout(buf):
+        runpy.run_module(module_name, run_name="__main__")
     return buf.getvalue().strip()
 
-def run_all() -> List[str]:
-    """
-    Повертає список готових текстових блоків (у форматі консолі),
-    які бот відправляє без змін.
-    """
-    texts: List[str] = []
-    for mod in MODULES:
-        out = _run_module_capture(mod)
-        if out:
-            texts.append(out)
-    return texts
+def run_all() -> list[str]:
+    modules = (
+        "parsers.epravda_parser",
+        "parsers.minfin_parser",
+        "parsers.coindesk_parser",
+    )
+    blocks: list[str] = []
+    for mod in modules:
+        try:
+            out = _run_and_capture(mod)
+            if out:
+                blocks.append(out)
+        except Exception as e:
+            blocks.append(f"❌ Помилка запуску {mod}: {e}")
+    return blocks
+
+if __name__ == "__main__":
+    for block in run_all():
+        print(block)
+        print()
