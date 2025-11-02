@@ -1,11 +1,15 @@
 # parsers/ain_parser.py
 import re
-import requests
-import xml.etree.ElementTree as ET
+import json
 from datetime import datetime, timedelta, timezone, date
-from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
+
+BASE = "https://ain.ua"
+LIST_URL = "https://ain.ua/"
 
 HEADERS = {
     "User-Agent": (
@@ -13,55 +17,154 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/126.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/rss+xml, text/xml;q=0.9, */*;q=0.8",
-    "Accept-Language": "uk-UA,uk;q=0.9,en;q=0.8",
-    "Referer": "https://www.google.com/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
-FEED_URL = "https://ain.ua/feed/"
-SOURCE_PAGE = "https://ain.ua/"
+# Відсікаємо ці розділи
+EXCLUDE_PREFIXES = ("/pop-science/", "/pop-science/music/", "/special/")
 
-# що відсікаємо
-EXCLUDE_PATH_PREFIXES = ("/pop-science/", "/special/", "/pop-science/music/")
-EXCLUDE_CATEGORIES = {"попнаука", "музика", "спецпроєкти"}
+def _fetch(url: str) -> BeautifulSoup:
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
-def _fetch_feed_xml(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=25)
-    resp.raise_for_status()
-    return resp.text
+def _is_excluded_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        path = p.path or ""
+        return any(path.startswith(pref) for pref in EXCLUDE_PREFIXES)
+    except Exception:
+        return False
 
-def _to_kyiv_date(pubdate_text: str) -> date | None:
-    if not pubdate_text:
+def _wrapper_has_excluded_tags(node: BeautifulSoup) -> bool:
+    # Перевіряємо теги в шапці картки
+    for a in node.select(".widget__header_tags a[href]"):
+        href = (a.get("href") or "").strip()
+        if any(href.startswith(p) for p in EXCLUDE_PREFIXES):
+            return True
+    return False
+
+def _probable_article_link(href: str) -> bool:
+    if not href:
+        return False
+    u = urlparse(href)
+    if u.netloc and u.netloc not in ("", "ain.ua", "www.ain.ua"):
+        return False
+    path = u.path or ""
+    # Типовий формат: /YYYY/MM/DD/slug/
+    if re.search(r"/\d{4}/\d{2}/\d{2}/", path):
+        return True
+    # Деякі матеріали без дати в URL — допускаємо глибину
+    return path.count("/") >= 3 and not path.endswith("/")
+
+def _iso_to_local_date(iso_str: str) -> date | None:
+    if not iso_str:
         return None
     try:
-        dt = parsedate_to_datetime(pubdate_text)
+        s = iso_str.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(KYIV_TZ).date()
     except Exception:
-        m = re.search(r"\d{4}-\d{2}-\d{2}", pubdate_text)
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", iso_str)
         if m:
             try:
-                return datetime.strptime(m.group(0), "%Y-%m-%d").date()
+                return datetime.strptime(m.group(1), "%Y-%m-%d").date()
             except Exception:
                 return None
         return None
 
-def _is_excluded(url: str, categories: list[str]) -> bool:
-    # 1) шлях у «спец»-розділах
-    try:
-        path = urlparse(url).path or ""
-        if any(path.startswith(p) for p in EXCLUDE_PATH_PREFIXES):
-            return True
-    except Exception:
-        pass
-    # 2) категорії з RSS (<category>)
-    low = { (c or "").strip().lower() for c in categories }
-    if low & EXCLUDE_CATEGORIES:
-        return True
-    return False
+def _extract_title_and_date(soup: BeautifulSoup) -> tuple[str | None, date | None]:
+    # 1) JSON-LD (в т.ч. @graph)
+    for sc in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(sc.string or "")
+        except Exception:
+            continue
+        objs = []
+        if isinstance(data, dict) and "@graph" in data and isinstance(data["@graph"], list):
+            objs = data["@graph"]
+        elif isinstance(data, list):
+            objs = data
+        elif isinstance(data, dict):
+            objs = [data]
+
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("@type") or obj.get("type") or ""
+            types = [t] if isinstance(t, str) else [x for x in t if isinstance(x, str)]
+            types = [x.lower() for x in types]
+            if any(x in ("newsarticle", "article", "blogposting") for x in types):
+                title = (obj.get("headline") or obj.get("name") or "").strip() or None
+                published = obj.get("datePublished") or obj.get("dateCreated") or obj.get("dateModified")
+                d = _iso_to_local_date(published) if published else None
+                if title or d:
+                    return title, d
+
+    # 2) meta / time
+    meta = soup.find("meta", {"property": "article:published_time"}) \
+        or soup.find("meta", {"name": "article:published_time"}) \
+        or soup.find("meta", {"property": "og:article:published_time"}) \
+        or soup.find("meta", {"itemprop": "datePublished"}) \
+        or soup.find("time", {"datetime": True})
+    d = None
+    if meta:
+        content = meta.get("content") or meta.get("datetime") or meta.get_text(strip=True)
+        d = _iso_to_local_date(content)
+
+    # 3) title fallback
+    title = None
+    og = soup.find("meta", {"property": "og:title"})
+    if og and og.get("content"):
+        title = og["content"].strip()
+    elif soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    return title, d
+
+def _collect_links(list_soup: BeautifulSoup, limit: int = 120) -> list[str]:
+    links, seen = [], set()
+
+    # A) Головні великі картки
+    for wrap in list_soup.select(".widget__content-wrapper"):
+        if _wrapper_has_excluded_tags(wrap):
+            continue
+        a = wrap.select_one("a.widget__content[href]")
+        if not a:
+            continue
+        href = a.get("href", "").strip()
+        url = urljoin(BASE, href) if href.startswith("/") else href
+        if not _probable_article_link(url) or _is_excluded_url(url):
+            continue
+        if url not in seen:
+            seen.add(url)
+            links.append(url)
+            if len(links) >= limit:
+                return links
+
+    # B) Спискові картки/інші блоки
+    for a in list_soup.select("a.widget__content[href], .widget a[href], h2 a[href]"):
+        href = a.get("href", "").strip()
+        url = urljoin(BASE, href) if href.startswith("/") else href
+        if not url or "ain.ua" not in url:
+            continue
+        if _is_excluded_url(url) or not _probable_article_link(url):
+            continue
+        if url in seen:
+            continue
+        # якщо є батьківський wrapper — також перевіримо теги
+        wrapper = a.find_parent(class_="widget__content-wrapper")
+        if wrapper and _wrapper_has_excluded_tags(wrapper):
+            continue
+        seen.add(url)
+        links.append(url)
+        if len(links) >= limit:
+            break
+
+    return links
 
 def parse_ain() -> list[dict]:
     print("🔹 Парсимо AIN.ua...")
@@ -70,56 +173,44 @@ def parse_ain() -> list[dict]:
     yesterday = today - timedelta(days=1)
     target_dates = {today, yesterday}
 
-    xml_text = _fetch_feed_xml(FEED_URL)
-    root = ET.fromstring(xml_text)
+    soup = _fetch(LIST_URL)
+    candidates = _collect_links(soup, limit=150)
 
-    items_raw = []
-    for item in root.findall(".//item"):
-        title_el = item.find("title")
-        link_el = item.find("link")
-        pub_el = item.find("pubDate")
-
-        title = (title_el.text or "").strip() if title_el is not None else ""
-        url = (link_el.text or "").strip() if link_el is not None else ""
-        pubdate = (pub_el.text or "").strip() if pub_el is not None else ""
-
-        d = _to_kyiv_date(pubdate)
+    items = []
+    for url in candidates:
+        try:
+            art = _fetch(url)
+        except Exception:
+            continue
+        title, d = _extract_title_and_date(art)
         if not d or d not in target_dates:
             continue
-
-        # зчитуємо всі <category> для фільтру
-        cats = [(c.text or "").strip() for c in item.findall("category")]
-        if _is_excluded(url, cats):
-            continue
-
-        items_raw.append(
-            {
-                "title": title,
-                "url": url,
-                "date": d.strftime("%Y-%m-%d"),
-                "source": SOURCE_PAGE,
-                "section": "ain.ua",
-            }
-        )
+        if not title:
+            title = "Без назви"
+        items.append({
+            "title": title,
+            "url": url,
+            "date": d.strftime("%Y-%m-%d"),
+            "source": LIST_URL,
+            "section": "ain.ua",
+        })
 
     # Дедуп за URL
-    seen = set()
-    unique = []
-    for n in items_raw:
+    seen, unique = set(), []
+    for n in items:
         if n["url"] in seen:
             continue
         seen.add(n["url"])
         unique.append(n)
 
     print("\n✅ ain - результат:")
-    print(f"   Усього знайдено {len(items_raw)} (з урахуванням дублів)")
+    print(f"   Усього знайдено {len(items)} (з урахуванням дублів)")
     print(f"   Унікальних новин: {len(unique)}\n")
 
-    print(f"🟢Джерело: {SOURCE_PAGE} — {len(unique)} новин:")
+    print(f"🟢Джерело: {LIST_URL} — {len(unique)} новин:")
     for i, n in enumerate(unique, 1):
         print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
     print()
-
     return unique
 
 if __name__ == "__main__":
