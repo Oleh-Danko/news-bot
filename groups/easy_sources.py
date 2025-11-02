@@ -19,7 +19,6 @@ def run_all() -> list[str]:
         "parsers.epravda_parser",
         "parsers.minfin_parser",
         "parsers.coindesk_parser",
-        "parsers.ain_parser",
     )
     blocks: list[str] = []
     for mod in modules:
