@@ -7,7 +7,12 @@ def _run_and_capture(module_name: str) -> str:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         runpy.run_module(module_name, run_name="__main__")
-    return buf.getvalue().strip()
+    text = buf.getvalue().strip()
+    if not text:
+        return ""
+    # додаємо 🟢 перед "Джерело:" у всіх виводах парсерів
+    text = text.replace("Джерело: ", "🟢Джерело: ")
+    return text
 
 def run_all() -> list[str]:
     modules = (

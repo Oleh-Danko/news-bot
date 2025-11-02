@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import Message, LinkPreviewOptions
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -38,15 +38,22 @@ except Exception:
 
 async def _safe_send_many(bot: Bot, chat_id: int, messages: List[str]):
     for m in messages:
-        # Дрібна безпечна нарізка по 3800, щоб зберегти ТЕКСТ БЕЗ ЗМІН
         if len(m) <= 4096:
-            await bot.send_message(chat_id, m)
+            await bot.send_message(
+                chat_id,
+                m,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
             await asyncio.sleep(PAUSE_BETWEEN_MSGS_SEC)
             continue
         start = 0
         while start < len(m):
             chunk = m[start:start + MAX_CHARS_PER_MSG]
-            await bot.send_message(chat_id, chunk)
+            await bot.send_message(
+                chat_id,
+                chunk,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
             start += MAX_CHARS_PER_MSG
             await asyncio.sleep(PAUSE_BETWEEN_MSGS_SEC)
 
@@ -60,39 +67,52 @@ bot = Bot(BOT_TOKEN, parse_mode=None)
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привіт! Доступні команди:\n"
-        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)"
+        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 @dp.message(Command("news_easy"))
 async def cmd_news_easy(message: Message):
     chat_id = message.chat.id
     try:
-        await message.answer("⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд.")
+        await message.answer(
+            "⏳ Збираю свіжі новини... Це може зайняти до 10–20 cекунд.",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
     except Exception:
         pass
 
     try:
         raw = await _maybe_await(parse_all_sources())
-        # Якщо парсери повертають готові текстові блоки — відправляємо «як є»
         if isinstance(raw, str):
             await _safe_send_many(bot, chat_id, [raw])
-            await bot.send_message(chat_id, "✅ Готово.")
+            await bot.send_message(
+                chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
             return
         if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
-            # ПО ЧЕРЗІ: спочатку epravda, потім minfin — нічого не змішуємо
             for block in raw:
                 await _safe_send_many(bot, chat_id, [block])
-            await bot.send_message(chat_id, "✅ Готово.")
+            await bot.send_message(
+                chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
             return
 
-        # Якщо колись повернеться структура — запасний сценарій (не використовується зараз)
-        await bot.send_message(chat_id, "⚠️ Порожній результат.")
-        await bot.send_message(chat_id, "✅ Готово.")
+        await bot.send_message(
+            chat_id, "⚠️ Порожній результат.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+        await bot.send_message(
+            chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
 
     except Exception as e:
         log.exception("Помилка у /news_easy: %s", e)
         try:
-            await bot.send_message(chat_id, "⚠️ Сталася помилка під час формування списку новин.")
+            await bot.send_message(
+                chat_id,
+                "⚠️ Сталася помилка під час формування списку новин.",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
         except Exception:
             pass
 

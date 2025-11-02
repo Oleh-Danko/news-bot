@@ -84,7 +84,7 @@ def parse_epravda() -> list[dict]:
     print(f"   Усього знайдено {len(all_found)} (з урахуванням дублів)")
     print(f"   Унікальних новин: {len(unique)}\n")
 
-    print(f"Джерело: https://epravda.com.ua/finances — {len(fin_items)} новин:")
+    print(f"🟢Джерело: https://epravda.com.ua/finances — {len(fin_items)} новин:")
     for i, n in enumerate(fin_items, 1):
         print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
     print()

@@ -124,7 +124,7 @@ def parse_minfin():
             to_print.append(it)
             printed_urls.add(it["url"])
 
-        print(f"Джерело: {src_url} — {len(to_print)} новин:")
+        print(f"🟢Джерело: {src_url} — {len(to_print)} новин:")
         for i, n in enumerate(to_print, 1):
             print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
         print()

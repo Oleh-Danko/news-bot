@@ -104,7 +104,7 @@ def parse_coindesk() -> list[dict]:
     print(f"   Усього знайдено {len(items)} (з урахуванням дублів)")
     print(f"   Унікальних новин: {len(items)}\n")
 
-    print(f"Джерело: {SOURCE_URL} — {len(items)} новин:")
+    print(f"🟢Джерело: {SOURCE_URL} — {len(items)} новин:")
     for i, n in enumerate(items, 1):
         print(f"{i}. {n['title']} ({n['date']})\n   {n['url']}")
     print()
