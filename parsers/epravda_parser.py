@@ -1,4 +1,5 @@
 # parsers/epravda_parser.py
+import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import date, timedelta
@@ -19,6 +20,8 @@ HEADERS = {
         "Chrome/126.0.0.0 Safari/537.36"
     )
 }
+
+ONLY_TODAY = os.environ.get("ONLY_TODAY") == "1"
 
 def _fetch(url: str) -> BeautifulSoup:
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -46,6 +49,7 @@ def _parse_ua_date(text: str) -> date | None:
 def _collect_finances(soup: BeautifulSoup) -> list[dict]:
     today = date.today()
     yesterday = today - timedelta(days=1)
+    allowed = {today} if ONLY_TODAY else {today, yesterday}
     items = []
     for news in soup.select(".article_news"):
         a = news.select_one(".article_title a")
@@ -56,7 +60,7 @@ def _collect_finances(soup: BeautifulSoup) -> list[dict]:
         url = urljoin(BASE, a.get("href", "").strip())
         date_str = d.get_text(strip=True) if d else ""
         dt = _parse_ua_date(date_str)
-        if dt in (today, yesterday):
+        if dt in allowed:
             items.append({
                 "title": title,
                 "url": url,

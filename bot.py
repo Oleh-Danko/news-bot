@@ -1,3 +1,4 @@
+# bot.py
 import os
 import asyncio
 import logging
@@ -30,10 +31,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("news-bot")
 
+# ⬇️ імпортуємо обидві збірки: звичайну і «тільки сьогодні»
 try:
-    from groups.easy_sources import run_all as parse_all_sources
+    from groups.easy_sources import run_all, run_all_today
 except Exception:
-    log.exception("Не вдалося імпортувати groups.easy_sources.run_all()")
+    log.exception("Не вдалося імпортувати groups.easy_sources.*")
     raise
 
 async def _safe_send_many(bot: Bot, chat_id: int, messages: List[str]):
@@ -67,7 +69,8 @@ bot = Bot(BOT_TOKEN, parse_mode=None)
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привіт! Доступні команди:\n"
-        "• /news_easy — Epravda + Minfin (унікальні, згруповані; без превʼю)",
+        "• /news_easy — Epravda + Minfin + CoinDesk (сьогодні+вчора; без превʼю)\n"
+        "• /news_today — тільки за сьогодні (без превʼю)",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -83,15 +86,11 @@ async def cmd_news_easy(message: Message):
         pass
 
     try:
-        raw = await _maybe_await(parse_all_sources())
-        if isinstance(raw, str):
-            await _safe_send_many(bot, chat_id, [raw])
-            await bot.send_message(
-                chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
-            )
-            return
-        if isinstance(raw, list) and all(isinstance(x, str) for x in raw):
-            for block in raw:
+        blocks = await _maybe_await(run_all(today_only=False))
+        if isinstance(blocks, str):
+            blocks = [blocks]
+        if isinstance(blocks, list) and all(isinstance(x, str) for x in blocks):
+            for block in blocks:
                 await _safe_send_many(bot, chat_id, [block])
             await bot.send_message(
                 chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
@@ -107,6 +106,47 @@ async def cmd_news_easy(message: Message):
 
     except Exception as e:
         log.exception("Помилка у /news_easy: %s", e)
+        try:
+            await bot.send_message(
+                chat_id,
+                "⚠️ Сталася помилка під час формування списку новин.",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            pass
+
+@dp.message(Command("news_today"))
+async def cmd_news_today(message: Message):
+    chat_id = message.chat.id
+    try:
+        await message.answer(
+            "⏳ Збираю новини за сьогодні... Це може зайняти до 10–20 cекунд.",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except Exception:
+        pass
+
+    try:
+        blocks = await _maybe_await(run_all_today())
+        if isinstance(blocks, str):
+            blocks = [blocks]
+        if isinstance(blocks, list) and all(isinstance(x, str) for x in blocks):
+            for block in blocks:
+                await _safe_send_many(bot, chat_id, [block])
+            await bot.send_message(
+                chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
+            return
+
+        await bot.send_message(
+            chat_id, "⚠️ Порожній результат.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+        await bot.send_message(
+            chat_id, "✅ Готово.", link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+
+    except Exception as e:
+        log.exception("Помилка у /news_today: %s", e)
         try:
             await bot.send_message(
                 chat_id,

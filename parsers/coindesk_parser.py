@@ -1,6 +1,7 @@
 # parsers/coindesk_parser.py
+import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from urllib.parse import urljoin
 
 import requests
@@ -16,6 +17,8 @@ HEADERS = {
         "Chrome/126.0.0.0 Safari/537.36"
     )
 }
+
+ONLY_TODAY = os.environ.get("ONLY_TODAY") == "1"
 
 def _fetch(url: str) -> BeautifulSoup:
     resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -38,7 +41,6 @@ def _extract_date_from_url(u: str) -> date | None:
         return None
 
 def _best_title(a_tag) -> str:
-    # 1) заголовок у <a>, 2) заголовок у найближчих h2/h3/h4 поруч
     t = (a_tag.get_text(strip=True) or "").strip()
     if t:
         return t
@@ -58,19 +60,17 @@ def parse_coindesk() -> list[dict]:
     soup = _fetch(SOURCE_URL)
     today = date.today()
     yesterday = today - timedelta(days=1)
-    target = {today, yesterday}
+    target = {today} if ONLY_TODAY else {today, yesterday}
 
     seen_urls = set()
     items: list[dict] = []
 
-    # Беремо всі посилання і фільтруємо тільки статті /uk/.../YYYY/MM/DD/...
     for a in soup.select('a[href]'):
         href = a.get("href", "").strip()
         if not href:
             continue
         url = _abs(href)
 
-        # тільки українська секція та сторінки-статті з датою в URL
         if "/uk/" not in url:
             continue
         if SOURCE_URL.rstrip("/") == url.rstrip("/"):
@@ -96,10 +96,8 @@ def parse_coindesk() -> list[dict]:
             "section": "coindesk-uk",
         })
 
-    # Сортуємо від новіших до старіших
     items.sort(key=lambda x: (x["date"], x["title"]), reverse=True)
 
-    # Вивід, як у решті парсерів
     print("\n✅ coindesk - результат:")
     print(f"   Усього знайдено {len(items)} (з урахуванням дублів)")
     print(f"   Унікальних новин: {len(items)}\n")

@@ -1,4 +1,5 @@
 # parsers/minfin_parser.py
+import os
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -14,43 +15,39 @@ HEADERS = {
 
 BASE_URL = "https://minfin.com.ua"
 
-SECTIONS = [       
-    "ua/news/money-management/",    # ← головна UA-стрічка (замість /news/)
+SECTIONS = [
+    "ua/news/money-management/",
     "ua/news/commerce/",
     "ua/news/improvement/",
-    "ua/news/",   
+    "ua/news/",
 ]
 
+ONLY_TODAY = os.environ.get("ONLY_TODAY") == "1"
 
 def _normalize_url(u: str) -> str:
-    """Приводимо URL до канонічного вигляду для коректної унікалізації."""
     u = u.strip()
     if not u.startswith("http"):
         u = BASE_URL + u
     s = urlsplit(u)
     netloc = s.netloc.lower()
-    path = s.path.rstrip("/")  # зрізаємо фінальний слеш
-    # прибираємо query і fragment
+    path = s.path.rstrip("/")
     return urlunsplit((s.scheme, netloc, path, "", ""))
-
 
 def _fetch(url: str) -> BeautifulSoup:
     resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
-
 def parse_minfin():
     all_news = []
-    per_source_raw = []  # [(src_url, [items_raw]), ...]
+    per_source_raw = []
 
     today = datetime.now().date()
     yesterday = today - timedelta(days=1)
-    target_dates = {today, yesterday}
+    target_dates = {today} if ONLY_TODAY else {today, yesterday}
 
     print("🔹 Парсимо Minfin...")
 
-    # 1) Збирання по джерелах (RAW, без друку)
     for section in SECTIONS:
         src_url = f"{BASE_URL}/{section.strip('/')}/"
         items_raw = []
@@ -72,7 +69,6 @@ def parse_minfin():
             href = title_tag.get("href", "").strip()
             raw_date = (date_tag.get("content") or date_tag.get_text(strip=True) or "").strip()
 
-            # Парсимо дату у форматах YYYY-MM-DD або DD.MM.YYYY (беремо тільки дату без часу)
             news_date = None
             parts0 = raw_date.split()
             if parts0:
@@ -99,7 +95,6 @@ def parse_minfin():
 
         per_source_raw.append((src_url, items_raw))
 
-    # 2) Глобальна унікалізація по нормалізованому URL
     seen = set()
     unique_news = []
     for news in all_news:
@@ -107,7 +102,6 @@ def parse_minfin():
             unique_news.append(news)
             seen.add(news["url"])
 
-    # 3) Друк результатів БЕЗ дублювання між джерелами
     total_with_dups = len(all_news)
     total_unique = len(unique_news)
     print(f"\n✅ minfin - результат:")
@@ -116,7 +110,6 @@ def parse_minfin():
 
     printed_urls = set()
     for src_url, items_raw in per_source_raw:
-        # залишаємо для друку тільки ті, яких ще не друкували
         to_print = []
         for it in items_raw:
             if it["url"] in printed_urls:
@@ -130,7 +123,6 @@ def parse_minfin():
         print()
 
     return unique_news
-
 
 if __name__ == "__main__":
     try:
